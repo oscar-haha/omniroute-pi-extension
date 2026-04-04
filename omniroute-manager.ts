@@ -831,7 +831,7 @@ export default function (pi: ExtensionAPI) {
 					]);
 
 					// Filter to inference calls only
-					const logs: CallLog[] = (rawLogs as any[]).filter(
+					const logs: any[] = (rawLogs as any[]).filter(
 						(l: any) => l.path === "/v1/messages"
 					);
 
@@ -840,11 +840,12 @@ export default function (pi: ExtensionAPI) {
 						return;
 					}
 
-					// Build per-model stats
+					// Build per-model stats keyed by "provider/model" as OmniRoute logs them
 					interface ModelStats {
 						attempts: number;
 						successes: number;
-						errors: Record<string, number>; // status → count
+						onlyContextErrors: boolean; // all failures are 413 (too large)
+						errors: Record<string, number>;
 						totalDuration: number;
 						errorMessages: string[];
 					}
@@ -853,22 +854,45 @@ export default function (pi: ExtensionAPI) {
 					for (const log of logs) {
 						const key = `${log.provider}/${log.model}`;
 						if (!stats.has(key)) {
-							stats.set(key, { attempts: 0, successes: 0, errors: {}, totalDuration: 0, errorMessages: [] });
+							stats.set(key, {
+								attempts: 0, successes: 0, onlyContextErrors: true,
+								errors: {}, totalDuration: 0, errorMessages: [],
+							});
 						}
 						const s = stats.get(key)!;
 						s.attempts++;
-						s.totalDuration += (log as any).duration ?? 0;
+						s.totalDuration += log.duration ?? 0;
 						if (log.status === 200) {
 							s.successes++;
+							s.onlyContextErrors = false;
 						} else {
 							const code = String(log.status);
 							s.errors[code] = (s.errors[code] ?? 0) + 1;
-							const errMsg = (log as any).error ?? "";
-							if (errMsg && !s.errorMessages.includes(errMsg.slice(0, 80))) {
+							const errMsg: string = log.error ?? "";
+							// 413 = context too large — model works, session is just too big
+							if (log.status !== 413) s.onlyContextErrors = false;
+							if (errMsg && !s.errorMessages.find((m) => m === errMsg.slice(0, 80))) {
 								s.errorMessages.push(errMsg.slice(0, 80));
 							}
 						}
 					}
+
+					// Match a combo model ID (prefix/model) to a call log stats key.
+					// OmniRoute logs use the full provider name (e.g. "kiro"), combos use
+					// short prefixes (e.g. "kr"). Match by the model name portion instead.
+					const findStats = (modelId: string): ModelStats | undefined => {
+						const modelName = modelId.split("/").slice(1).join("/");
+						// First try exact prefix match
+						for (const [key, s] of stats) {
+							const logModelName = key.split("/").slice(1).join("/");
+							if (logModelName === modelName) return s;
+						}
+						// Fallback: partial suffix match (handles nested paths)
+						for (const [key, s] of stats) {
+							if (key.endsWith(`/${modelName}`) || key === modelName) return s;
+						}
+						return undefined;
+					};
 
 					// Build report per combo
 					const lines: string[] = ["═══ OmniRoute Log Review ═══", `(last ${logs.length} inference calls)`, ""];
@@ -881,34 +905,33 @@ export default function (pi: ExtensionAPI) {
 						);
 
 						for (const modelId of comboModels) {
-							// Stats key: OmniRoute logs use provider/model separately; try to match
-							const matchedKey = [...stats.keys()].find((k) => {
-								const [provider, ...rest] = modelId.split("/");
-								return k === `${provider}/${rest.join("/")}`;
-							});
+							const s = findStats(modelId);
 
-							if (!matchedKey) {
+							if (!s) {
 								lines.push(`  ❓ ${modelId}  (no history)`);
 								continue;
 							}
 
-							const s = stats.get(matchedKey)!;
 							const rate = Math.round((s.successes / s.attempts) * 100);
 							const avgMs = Math.round(s.totalDuration / s.attempts);
 							const errSummary = Object.entries(s.errors)
 								.map(([code, n]) => `${code}×${n}`)
 								.join(", ");
 
-							if (s.successes === 0) {
-								// Always fails — recommend removal
+							if (s.successes === 0 && s.onlyContextErrors) {
+								// All failures are 413 — model works, context was too large
+								lines.push(`  ⚠️  ${modelId}`);
+								lines.push(`     context too large for free tier (${s.attempts}× 413) — works in shorter sessions`);
+							} else if (s.successes === 0) {
+								// Genuinely broken
 								lines.push(`  ❌ ${modelId}`);
-								lines.push(`     0/${s.attempts} success · errors: ${errSummary}`);
+								lines.push(`     0/${s.attempts} success · ${errSummary}`);
 								if (s.errorMessages[0]) lines.push(`     "${s.errorMessages[0]}"`);
 								lines.push(`     → suggest remove`);
 								removals.push({ comboId: combo.id, comboName: combo.name, modelId });
 							} else if (rate < 60) {
 								lines.push(`  ⚠️  ${modelId}`);
-								lines.push(`     ${s.successes}/${s.attempts} success (${rate}%) · avg ${avgMs}ms · errors: ${errSummary}`);
+								lines.push(`     ${s.successes}/${s.attempts} success (${rate}%) · avg ${avgMs}ms · ${errSummary}`);
 							} else if (avgMs > 30000) {
 								lines.push(`  ⏱  ${modelId}`);
 								lines.push(`     ${rate}% success · avg ${Math.round(avgMs / 1000)}s (slow)`);
