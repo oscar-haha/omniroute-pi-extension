@@ -413,9 +413,9 @@ export default function (pi: ExtensionAPI) {
 	// ── /omni command ──
 
 	pi.registerCommand("omni", {
-		description: "OmniRoute: /omni [toggle|providers|add-provider|sync|dashboard]",
+		description: "OmniRoute: /omni [toggle|providers|add-provider|sync|log-review|dashboard]",
 		getArgumentCompletions(prefix: string) {
-			return ["toggle", "providers", "add-provider", "sync", "dashboard"]
+			return ["toggle", "providers", "add-provider", "sync", "log-review", "dashboard"]
 				.filter((s) => s.startsWith(prefix))
 				.map((s) => ({ value: s, label: s }));
 		},
@@ -465,10 +465,11 @@ export default function (pi: ExtensionAPI) {
 					"",
 					"─── Commands ───",
 					"",
-					"  /omni toggle          Toggle combos on/off",
+					"  /omni toggle          Toggle combos on/off · set active model",
 					"  /omni providers       Browse providers & models",
 					"  /omni add-provider    Add OpenAI-compatible provider",
 					"  /omni sync            Sync models to Ctrl+P picker",
+					"  /omni log-review      Analyse call logs · remove broken models",
 					"  /omni dashboard       Dashboard URL",
 				);
 
@@ -818,6 +819,159 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
+			// ──────────────── /omni log-review ────────────────
+
+			if (sub === "log-review" || sub === "logreview") {
+				ctx.ui.notify("Fetching call logs…", "info");
+
+				try {
+					const [combos, rawLogs] = await Promise.all([
+						listCombos(),
+						api("/api/usage/call-logs?limit=200"),
+					]);
+
+					// Filter to inference calls only
+					const logs: CallLog[] = (rawLogs as any[]).filter(
+						(l: any) => l.path === "/v1/messages"
+					);
+
+					if (!logs.length) {
+						ctx.ui.notify("No call log history yet.", "info");
+						return;
+					}
+
+					// Build per-model stats
+					interface ModelStats {
+						attempts: number;
+						successes: number;
+						errors: Record<string, number>; // status → count
+						totalDuration: number;
+						errorMessages: string[];
+					}
+					const stats = new Map<string, ModelStats>();
+
+					for (const log of logs) {
+						const key = `${log.provider}/${log.model}`;
+						if (!stats.has(key)) {
+							stats.set(key, { attempts: 0, successes: 0, errors: {}, totalDuration: 0, errorMessages: [] });
+						}
+						const s = stats.get(key)!;
+						s.attempts++;
+						s.totalDuration += (log as any).duration ?? 0;
+						if (log.status === 200) {
+							s.successes++;
+						} else {
+							const code = String(log.status);
+							s.errors[code] = (s.errors[code] ?? 0) + 1;
+							const errMsg = (log as any).error ?? "";
+							if (errMsg && !s.errorMessages.includes(errMsg.slice(0, 80))) {
+								s.errorMessages.push(errMsg.slice(0, 80));
+							}
+						}
+					}
+
+					// Build report per combo
+					const lines: string[] = ["═══ OmniRoute Log Review ═══", `(last ${logs.length} inference calls)`, ""];
+					const removals: Array<{ comboId: string; comboName: string; modelId: string }> = [];
+
+					for (const combo of combos) {
+						lines.push(`─── ${combo.name} [${combo.strategy}] ───`);
+						const comboModels = combo.models.map((m) =>
+							typeof m === "string" ? m : m.model
+						);
+
+						for (const modelId of comboModels) {
+							// Stats key: OmniRoute logs use provider/model separately; try to match
+							const matchedKey = [...stats.keys()].find((k) => {
+								const [provider, ...rest] = modelId.split("/");
+								return k === `${provider}/${rest.join("/")}`;
+							});
+
+							if (!matchedKey) {
+								lines.push(`  ❓ ${modelId}  (no history)`);
+								continue;
+							}
+
+							const s = stats.get(matchedKey)!;
+							const rate = Math.round((s.successes / s.attempts) * 100);
+							const avgMs = Math.round(s.totalDuration / s.attempts);
+							const errSummary = Object.entries(s.errors)
+								.map(([code, n]) => `${code}×${n}`)
+								.join(", ");
+
+							if (s.successes === 0) {
+								// Always fails — recommend removal
+								lines.push(`  ❌ ${modelId}`);
+								lines.push(`     0/${s.attempts} success · errors: ${errSummary}`);
+								if (s.errorMessages[0]) lines.push(`     "${s.errorMessages[0]}"`);
+								lines.push(`     → suggest remove`);
+								removals.push({ comboId: combo.id, comboName: combo.name, modelId });
+							} else if (rate < 60) {
+								lines.push(`  ⚠️  ${modelId}`);
+								lines.push(`     ${s.successes}/${s.attempts} success (${rate}%) · avg ${avgMs}ms · errors: ${errSummary}`);
+							} else if (avgMs > 30000) {
+								lines.push(`  ⏱  ${modelId}`);
+								lines.push(`     ${rate}% success · avg ${Math.round(avgMs / 1000)}s (slow)`);
+							} else {
+								lines.push(`  ✅ ${modelId}`);
+								lines.push(`     ${rate}% success · avg ${avgMs}ms`);
+							}
+						}
+
+						lines.push("");
+					}
+
+					ctx.ui.notify(lines.join("\n"), "info");
+
+					// Offer to remove the always-failing models
+					if (removals.length === 0) return;
+
+					const confirmed = await ctx.ui.confirm(
+						"Remove broken models?",
+						`${removals.length} model(s) have 0% success rate:\n` +
+						removals.map((r) => `  • ${r.comboName}: ${r.modelId}`).join("\n") +
+						"\n\nRemove them from their combos?"
+					);
+
+					if (!confirmed) return;
+
+					// Group removals by combo
+					const byCombo = new Map<string, { id: string; name: string; remove: Set<string> }>();
+					for (const r of removals) {
+						if (!byCombo.has(r.comboId)) {
+							byCombo.set(r.comboId, { id: r.comboId, name: r.comboName, remove: new Set() });
+						}
+						byCombo.get(r.comboId)!.remove.add(r.modelId);
+					}
+
+					const allCombos = await listCombos();
+					const results: string[] = [];
+
+					for (const { id, name, remove } of byCombo.values()) {
+						const combo = allCombos.find((c) => c.id === id);
+						if (!combo) continue;
+						const kept = combo.models
+							.map((m) => (typeof m === "string" ? m : m.model))
+							.filter((m) => !remove.has(m));
+
+						try {
+							await api(`/api/combos/${id}`, {
+								method: "PUT",
+								body: JSON.stringify({ models: kept }),
+							});
+							results.push(`✅ ${name}: removed ${remove.size} model(s), ${kept.length} remaining`);
+						} catch (e: any) {
+							results.push(`❌ ${name}: ${e.message}`);
+						}
+					}
+
+					ctx.ui.notify(results.join("\n"), "info");
+				} catch (e: any) {
+					ctx.ui.notify(`Log review failed: ${e.message}`, "error");
+				}
+				return;
+			}
+
 			// ──────────────── /omni dashboard ────────────────
 
 			if (sub === "dashboard" || sub === "dash") {
@@ -840,7 +994,7 @@ export default function (pi: ExtensionAPI) {
 			// ──────────────── Unknown ────────────────
 
 			ctx.ui.notify(
-				`Unknown: /omni ${sub}\n\nAvailable: toggle, providers, add-provider, sync, dashboard`,
+				`Unknown: /omni ${sub}\n\nAvailable: toggle, providers, add-provider, sync, log-review, dashboard`,
 				"warning"
 			);
 		},
