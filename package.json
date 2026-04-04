@@ -11,12 +11,15 @@
     "extension",
     "coding-agent"
   ],
-  "main": "omniroute-manager.ts",
+  "main": "extensions/omniroute-manager.ts",
   "files": [
-    "omniroute-manager.ts",
+    "extensions/omniroute-manager.ts",
     "README.md",
     "LICENSE"
   ],
+  "pi": {
+    "extensions": ["./extensions/omniroute-manager.ts"]
+  },
   "author": "Oscar Andrea",
   "license": "MIT",
   "repository": {
