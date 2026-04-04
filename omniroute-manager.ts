@@ -307,12 +307,7 @@ function humanName(id: string): string {
 
 export default function (pi: ExtensionAPI) {
 	let healthInterval: ReturnType<typeof setInterval> | undefined;
-	let lastInputTime = 0; // ms timestamp of most recent user input turn
-
-	// Track when the user sends a message so we can correlate the call log
-	pi.on("input", () => {
-		lastInputTime = Date.now();
-	});
+	let lastSeenLogId = ""; // ID of the most recent call log entry we've already displayed
 
 	// ── Show resolved model in status bar after each response ──
 
@@ -321,32 +316,56 @@ export default function (pi: ExtensionAPI) {
 			const msg = event.message as any;
 			if (msg?.role !== "assistant") return;
 
-			// Poll for a call log entry that is newer than when this turn started.
-			// OmniRoute writes the log after the response stream closes, so we
-			// retry up to ~3 seconds rather than using a fixed one-shot delay.
-			const turnStart = lastInputTime || Date.now();
+			// Poll until we see a NEW call log entry (one we haven't shown yet).
+			// This avoids any timestamp comparison issues — we simply wait for
+			// the log ID to change. Max ~4.5 seconds (15 × 300 ms).
 			let log: CallLog | null = null;
 
-			for (let attempt = 0; attempt < 10; attempt++) {
+			for (let attempt = 0; attempt < 15; attempt++) {
 				await new Promise((r) => setTimeout(r, 300));
 				const candidate = await getLastCallLog();
 				if (!candidate) break;
-
-				// Parse timestamp from log ID ("1775332387952-28" → ms epoch)
-				const logMs = parseInt(candidate.id?.split("-")[0] ?? "0", 10);
-				if (logMs >= turnStart) {
+				if (candidate.id !== lastSeenLogId) {
 					log = candidate;
 					break;
 				}
 			}
 
 			if (log) {
+				lastSeenLogId = log.id;
 				const combo = log.comboName ? `${log.comboName} → ` : "";
 				const acct = log.account ? ` · ${log.account}` : "";
 				const ok = log.status === 200;
 				const suffix = ok ? "" : ` ✗${log.status}`;
 				ctx.ui.setStatus("omni", `${combo}${log.model} (${log.provider}${acct})${suffix}`);
 			}
+		} catch {}
+	});
+
+	// ── Show predicted routing when model selection changes ──
+
+	pi.on("model_select", async (event, ctx) => {
+		try {
+			const modelId = (event.model as any)?.id ?? "";
+			if (!modelId) return;
+
+			// Check if the selected model is a combo
+			const combos = await listCombos();
+			const combo = combos.find((c) => c.name === modelId);
+
+			if (!combo) {
+				// Plain model, just show it
+				ctx.ui.setStatus("omni", `→ ${modelId}`);
+				return;
+			}
+
+			// For combos, show the ordered model list so user knows what to expect
+			const models = combo.models.map((m) =>
+				typeof m === "string" ? m : m.model
+			);
+			const preview = models.slice(0, 3).join(" › ");
+			const more = models.length > 3 ? ` +${models.length - 3}` : "";
+			ctx.ui.setStatus("omni", `${combo.name} [${combo.strategy}]: ${preview}${more}`);
 		} catch {}
 	});
 
