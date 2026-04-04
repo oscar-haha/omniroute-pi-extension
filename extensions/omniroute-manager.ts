@@ -15,6 +15,7 @@
  *   /omni providers        — Browse providers → drill into models
  *   /omni add-provider     — Add an OpenAI-compatible provider not built into OmniRoute
  *   /omni sync             — Sync all OmniRoute models to pi's Ctrl+P picker
+ *   /omni setup-key        — Create an OmniRoute API key and save it to models.json
  *   /omni dashboard        — Show OmniRoute web dashboard URL
  *
  * Installation:
@@ -413,9 +414,9 @@ export default function (pi: ExtensionAPI) {
 	// ── /omni command ──
 
 	pi.registerCommand("omni", {
-		description: "OmniRoute: /omni [toggle|providers|add-provider|sync|log-review|dashboard]",
+		description: "OmniRoute: /omni [toggle|providers|add-provider|sync|log-review|setup-key|dashboard]",
 		getArgumentCompletions(prefix: string) {
-			return ["toggle", "providers", "add-provider", "sync", "log-review", "dashboard"]
+			return ["toggle", "providers", "add-provider", "sync", "log-review", "setup-key", "dashboard"]
 				.filter((s) => s.startsWith(prefix))
 				.map((s) => ({ value: s, label: s }));
 		},
@@ -470,6 +471,7 @@ export default function (pi: ExtensionAPI) {
 					"  /omni add-provider    Add OpenAI-compatible provider",
 					"  /omni sync            Sync models to Ctrl+P picker",
 					"  /omni log-review      Analyse call logs · remove broken models",
+					"  /omni setup-key       Create OmniRoute API key & save to models.json",
 					"  /omni dashboard       Dashboard URL",
 				);
 
@@ -1042,6 +1044,131 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
+			// ──────────────── /omni setup-key ────────────────
+
+			if (sub === "setup-key" || sub === "setupkey") {
+				const fs = require("fs");
+				const path = modelsJsonPath();
+
+				// Check current state
+				let currentKey = "";
+				try {
+					const data = JSON.parse(fs.readFileSync(path, "utf8"));
+					currentKey = data?.providers?.omni?.apiKey || "";
+				} catch {}
+
+				if (currentKey && currentKey !== "1" && currentKey.startsWith("omni-")) {
+					const overwrite = await ctx.ui.select(
+						`An OmniRoute API key is already configured (${currentKey.slice(0, 12)}…). Replace it?`,
+						["Yes — create a new key", "No — keep existing"]
+					);
+					if (!overwrite || overwrite.startsWith("No")) return;
+				}
+
+				// Get admin password
+				const password = await ctx.ui.input(
+					"OmniRoute admin password",
+					"The password you set during OmniRoute onboarding"
+				);
+				if (!password) return;
+
+				// Login to get session cookie
+				let authCookie = "";
+				try {
+					const loginRes = await fetch(`${OMNI_URL}/api/auth/login`, {
+						method: "POST",
+						headers: { "Content-Type": "application/json" },
+						body: JSON.stringify({ password }),
+						signal: AbortSignal.timeout(10000),
+					});
+					if (!loginRes.ok) {
+						const body = await loginRes.text();
+						if (loginRes.status === 401) {
+							ctx.ui.notify("Wrong password. Check your OmniRoute admin password.", "error");
+						} else {
+							ctx.ui.notify(`Login failed: ${loginRes.status} ${body}`, "error");
+						}
+						return;
+					}
+					// Extract auth_token cookie
+					const setCookie = loginRes.headers.get("set-cookie") || "";
+					const match = setCookie.match(/auth_token=([^;]+)/);
+					if (match) authCookie = match[1];
+					if (!authCookie) {
+						ctx.ui.notify("Login succeeded but no session cookie returned. Is OmniRoute up to date?", "error");
+						return;
+					}
+				} catch (e: any) {
+					ctx.ui.notify(`Could not reach OmniRoute: ${e.message}`, "error");
+					return;
+				}
+
+				// Create API key
+				let newKey = "";
+				try {
+					const createRes = await fetch(`${OMNI_URL}/api/keys`, {
+						method: "POST",
+						headers: {
+							"Content-Type": "application/json",
+							Cookie: `auth_token=${authCookie}`,
+						},
+						body: JSON.stringify({ name: "pi-agent" }),
+						signal: AbortSignal.timeout(10000),
+					});
+					if (!createRes.ok) {
+						ctx.ui.notify(`Failed to create key: ${createRes.status} ${await createRes.text()}`, "error");
+						return;
+					}
+					const result = await createRes.json();
+					newKey = result.key;
+					if (!newKey) {
+						ctx.ui.notify("Key created but no key value returned. Check the OmniRoute dashboard.", "error");
+						return;
+					}
+				} catch (e: any) {
+					ctx.ui.notify(`Key creation failed: ${e.message}`, "error");
+					return;
+				}
+
+				// Write key into models.json
+				try {
+					let config: any = {};
+					try {
+						config = JSON.parse(fs.readFileSync(path, "utf8"));
+					} catch {}
+
+					if (!config.providers) config.providers = {};
+					if (!config.providers.omni) {
+						config.providers.omni = {
+							baseUrl: OMNI_URL,
+							api: "anthropic-messages",
+							apiKey: newKey,
+							models: [],
+						};
+					} else {
+						config.providers.omni.apiKey = newKey;
+					}
+
+					fs.writeFileSync(path, JSON.stringify(config, null, 2));
+					ctx.ui.notify(
+						`✅ API key created and saved to models.json\n\n` +
+						`  Key: ${newKey.slice(0, 12)}…\n` +
+						`  File: ${path}\n\n` +
+						`Run /omni sync to pull models into the Ctrl+P picker.`,
+						"info"
+					);
+				} catch (e: any) {
+					// Key was created but couldn't save — show it so user doesn't lose it
+					ctx.ui.notify(
+						`⚠️ Key created but failed to save to models.json: ${e.message}\n\n` +
+						`  Your key: ${newKey}\n\n` +
+						`  Manually add it to ${path} under providers.omni.apiKey`,
+						"warning"
+					);
+				}
+				return;
+			}
+
 			// ──────────────── /omni dashboard ────────────────
 
 			if (sub === "dashboard" || sub === "dash") {
@@ -1064,7 +1191,7 @@ export default function (pi: ExtensionAPI) {
 			// ──────────────── Unknown ────────────────
 
 			ctx.ui.notify(
-				`Unknown: /omni ${sub}\n\nAvailable: toggle, providers, add-provider, sync, log-review, dashboard`,
+				`Unknown: /omni ${sub}\n\nAvailable: toggle, providers, add-provider, sync, log-review, setup-key, dashboard`,
 				"warning"
 			);
 		},
