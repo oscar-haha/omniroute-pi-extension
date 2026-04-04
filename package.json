@@ -1,0 +1,33 @@
+{
+  "name": "omniroute-pi-extension",
+  "version": "1.0.0",
+  "description": "Pi Coding Agent extension for OmniRoute — manage combos, browse providers, and see which model actually served each response in the status bar",
+  "keywords": [
+    "pi-package",
+    "pi-coding-agent",
+    "omniroute",
+    "llm",
+    "ai-gateway",
+    "extension",
+    "coding-agent"
+  ],
+  "main": "omniroute-manager.ts",
+  "files": [
+    "omniroute-manager.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "author": "Oscar Andrea",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/oscarandrea/omniroute-pi-extension.git"
+  },
+  "homepage": "https://github.com/oscarandrea/omniroute-pi-extension#readme",
+  "bugs": {
+    "url": "https://github.com/oscarandrea/omniroute-pi-extension/issues"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": ">=0.60.0"
+  }
+}
