@@ -445,17 +445,22 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 
+				// Determine which model is currently active
+				const currentModel = ctx.model;
+				const currentModelId = (currentModel as any)?.id ?? "";
+
 				let keepGoing = true;
 				while (keepGoing) {
 					const current = await listCombos();
 					const options = current.map((c) => {
 						const on = c.isActive !== false;
-						return `${on ? "✅ ON " : "⬜ OFF"} ${c.name} [${c.strategy}, ${c.models.length} models]`;
+						const live = c.name === currentModelId ? " 🔴 LIVE" : "";
+						return `${on ? "✅ ON " : "⬜ OFF"} ${c.name} [${c.strategy}, ${c.models.length} models]${live}`;
 					});
 					options.push("── Done ──");
 
 					const choice = await ctx.ui.select(
-						"Toggle combo (select to flip, Done to finish):",
+						"Select a combo (toggle on/off or set as active model):",
 						options
 					);
 					if (!choice || choice === "── Done ──") {
@@ -467,21 +472,56 @@ export default function (pi: ExtensionAPI) {
 					if (idx < 0 || idx >= current.length) continue;
 
 					const combo = current[idx];
-					const newState = combo.isActive === false;
-					try {
-						await api(`/api/combos/${combo.id}`, {
-							method: "PUT",
-							body: JSON.stringify({ isActive: newState }),
-						});
-						ctx.ui.notify(`${combo.name}: ${newState ? "✅ ON" : "⬜ OFF"}`, "info");
-					} catch (e: any) {
-						ctx.ui.notify(`Failed to toggle ${combo.name}: ${e.message}`, "error");
+					const on = combo.isActive !== false;
+
+					const action = await ctx.ui.select(
+						`${combo.name} — what do you want to do?`,
+						[
+							on ? "⬜ Turn OFF" : "✅ Turn ON",
+							"🔴 Set as active model (use for next message)",
+							"← Back",
+						]
+					);
+
+					if (!action || action === "← Back") continue;
+
+					if (action.startsWith("⬜") || action.startsWith("✅")) {
+						const newState = !on;
+						try {
+							await api(`/api/combos/${combo.id}`, {
+								method: "PUT",
+								body: JSON.stringify({ isActive: newState }),
+							});
+							ctx.ui.notify(`${combo.name}: ${newState ? "✅ ON" : "⬜ OFF"}`, "info");
+						} catch (e: any) {
+							ctx.ui.notify(`Failed to toggle ${combo.name}: ${e.message}`, "error");
+						}
+					} else if (action.startsWith("🔴")) {
+						const model = ctx.modelRegistry.find("omni", combo.name);
+						if (!model) {
+							ctx.ui.notify(
+								`"${combo.name}" not found in Ctrl+P model list.\nRun /omni sync first to add all combos.`,
+								"warning"
+							);
+							continue;
+						}
+						const ok = await pi.setModel(model);
+						if (ok) {
+							ctx.ui.notify(`🔴 Now using: ${combo.name}`, "info");
+							ctx.ui.setStatus("omni", `🔴 ${combo.name}`);
+						} else {
+							ctx.ui.notify(`Couldn't switch to ${combo.name} — no API key configured for the omni provider.`, "error");
+						}
 					}
 				}
 
 				const final = await listCombos();
+				const liveNow = (ctx.model as any)?.id ?? "";
 				ctx.ui.notify(
-					`Current combos:\n${final.map((c, i) => comboLine(c, i)).join("\n")}`,
+					`Current combos:\n${final.map((c, i) => {
+						const live = c.name === liveNow ? " 🔴 LIVE" : "";
+						return comboLine(c, i) + live;
+					}).join("\n")}`,
 					"info"
 				);
 				return;
