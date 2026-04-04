@@ -15,6 +15,7 @@
  *   /omni providers        — Browse providers → drill into models
  *   /omni add-provider     — Add an OpenAI-compatible provider not built into OmniRoute
  *   /omni sync             — Sync all OmniRoute models to pi's Ctrl+P picker
+ *   /omni doctor           — Diagnose & auto-fix common issues (conn: combos, missing projectId, etc.)
  *   /omni setup-key        — Create an OmniRoute API key and save it to models.json
  *   /omni dashboard        — Show OmniRoute web dashboard URL
  *
@@ -129,6 +130,9 @@ interface Connection {
 	testStatus?: string;
 	lastError?: string;
 	errorCode?: string;
+	projectId?: string;
+	tokenExpiresAt?: string;
+	expiresAt?: string;
 	providerSpecificData?: { prefix?: string; nodeName?: string; baseUrl?: string };
 }
 
@@ -217,6 +221,104 @@ function groupProviders(connections: Connection[], nodes: ProviderNode[]): Provi
 	}
 
 	return Array.from(groups.values()).sort((a, b) => a.displayName.localeCompare(b.displayName));
+}
+
+// ────────────────────────── doctor diagnostics ──────────────────────────
+
+interface DoctorIssue {
+	severity: "error" | "warning" | "info";
+	message: string;
+	fix?: () => Promise<string>; // returns result message
+}
+
+/** Find combos with conn:-prefixed models and build fixes to replace with provider-level IDs */
+function findConnPrefixedCombos(combos: Combo[], connections: Connection[]): DoctorIssue[] {
+	const issues: DoctorIssue[] = [];
+	const connMap = new Map(connections.map((c) => [c.id, c]));
+
+	for (const combo of combos) {
+		const models = combo.models.map((m) => (typeof m === "string" ? m : m.model));
+		const connModels = models.filter((m) => m.startsWith("conn:"));
+		if (connModels.length === 0) continue;
+
+		// Build replacement: resolve conn:UUID/model → provider/model
+		const replacements = new Map<string, string>();
+		for (const cm of connModels) {
+			const match = cm.match(/^conn:([^/]+)\/(.+)$/);
+			if (!match) continue;
+			const [, connId, modelName] = match;
+			const conn = connMap.get(connId);
+			const provider = conn?.provider || "unknown";
+			replacements.set(cm, `${provider}/${modelName}`);
+		}
+
+		const fixedModels = models.map((m) => replacements.get(m) || m);
+		// Deduplicate — multiple conn: entries may resolve to the same provider/model
+		const uniqueModels = fixedModels.filter((m, i) => fixedModels.indexOf(m) === i);
+
+		issues.push({
+			severity: "error",
+			message: `Combo "${combo.name}" uses ${connModels.length} connection-pinned model(s) (conn:…). ` +
+				`These fail when that specific account's token expires. ` +
+				`Fix: replace with provider-level IDs so OmniRoute can pick any healthy account.`,
+			fix: async () => {
+				await api(`/api/combos/${combo.id}`, {
+					method: "PUT",
+					body: JSON.stringify({ models: uniqueModels }),
+				});
+				return `✅ Fixed "${combo.name}": ${connModels.length} conn: refs → ${uniqueModels.join(", ")}`;
+			},
+		});
+	}
+	return issues;
+}
+
+/** Find antigravity accounts missing projectId */
+function findMissingProjectIds(connections: Connection[]): DoctorIssue[] {
+	return connections
+		.filter((c) => c.provider === "antigravity" && c.isActive && !c.projectId)
+		.map((c) => ({
+			severity: "warning" as const,
+			message: `Antigravity account "${c.name}" is missing projectId — Google will reject requests with 400. ` +
+				`Reconnect this account in the dashboard: ${DASHBOARD_URL} → Providers → disconnect & reconnect.`,
+		}));
+}
+
+/** Check if the pi models.json API key looks invalid */
+function checkApiKey(): DoctorIssue[] {
+	const key = getApiKey();
+	if (!key) {
+		return [{
+			severity: "error",
+			message: `No API key configured in models.json. Run /omni setup-key to create one.`,
+		}];
+	}
+	if (!key.startsWith("omni-") || key.length < 10) {
+		return [{
+			severity: "warning",
+			message: `API key "${key}" doesn't look like a valid OmniRoute key (expected "omni-…"). Run /omni setup-key to create a proper one.`,
+		}];
+	}
+	return [];
+}
+
+/** Check for accounts with expired or soon-to-expire tokens */
+function findExpiringAccounts(connections: Connection[]): DoctorIssue[] {
+	const issues: DoctorIssue[] = [];
+	const now = Date.now();
+	for (const c of connections) {
+		if (!c.isActive || c.authType !== "oauth") continue;
+		if (c.expiresAt) {
+			const exp = new Date(c.expiresAt).getTime();
+			if (exp < now) {
+				issues.push({
+					severity: "warning",
+					message: `Account "${c.name}" (${c.provider}) OAuth session expired. Reconnect in dashboard.`,
+				});
+			}
+		}
+	}
+	return issues;
 }
 
 // ────────────────────────── call log (resolved model tracking) ──────────────────────────
@@ -395,6 +497,28 @@ export default function (pi: ExtensionAPI) {
 					"warning"
 				);
 			}
+
+			// Proactive diagnostics on startup
+			const issues = [
+				...checkApiKey(),
+				...findConnPrefixedCombos(combos, conns),
+				...findMissingProjectIds(conns),
+				...findExpiringAccounts(conns),
+			];
+			const fixable = issues.filter((i) => i.fix);
+			const warnings = issues.filter((i) => !i.fix && i.severity !== "info");
+
+			if (fixable.length > 0) {
+				ctx.ui.notify(
+					`⚠️ ${fixable.length} auto-fixable issue(s) detected. Run /omni doctor to diagnose & fix.`,
+					"warning"
+				);
+			}
+			if (warnings.length > 0) {
+				for (const w of warnings) {
+					ctx.ui.notify(`⚠️ ${w.message}`, "warning");
+				}
+			}
 		} else {
 			ctx.ui.notify(`OmniRoute not responding at ${OMNI_URL}`, "warning");
 		}
@@ -414,9 +538,9 @@ export default function (pi: ExtensionAPI) {
 	// ── /omni command ──
 
 	pi.registerCommand("omni", {
-		description: "OmniRoute: /omni [toggle|providers|add-provider|sync|log-review|setup-key|dashboard]",
+		description: "OmniRoute: /omni [toggle|providers|add-provider|sync|log-review|doctor|setup-key|dashboard]",
 		getArgumentCompletions(prefix: string) {
-			return ["toggle", "providers", "add-provider", "sync", "log-review", "setup-key", "dashboard"]
+			return ["toggle", "providers", "add-provider", "sync", "log-review", "doctor", "setup-key", "dashboard"]
 				.filter((s) => s.startsWith(prefix))
 				.map((s) => ({ value: s, label: s }));
 		},
@@ -471,6 +595,7 @@ export default function (pi: ExtensionAPI) {
 					"  /omni add-provider    Add OpenAI-compatible provider",
 					"  /omni sync            Sync models to Ctrl+P picker",
 					"  /omni log-review      Analyse call logs · remove broken models",
+					"  /omni doctor          Diagnose & auto-fix common issues",
 					"  /omni setup-key       Create OmniRoute API key & save to models.json",
 					"  /omni dashboard       Dashboard URL",
 				);
@@ -1044,6 +1169,76 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
+			// ──────────────── /omni doctor ────────────────
+
+			if (sub === "doctor" || sub === "doc") {
+				ctx.ui.notify("Running diagnostics…", "info");
+
+				const [combos, conns] = await Promise.all([listCombos(), listConnections()]);
+				const issues = [
+					...checkApiKey(),
+					...findConnPrefixedCombos(combos, conns),
+					...findMissingProjectIds(conns),
+					...findExpiringAccounts(conns),
+				];
+
+				if (issues.length === 0) {
+					ctx.ui.notify("✅ No issues found — everything looks healthy.", "info");
+					return;
+				}
+
+				// Display all issues
+				const lines = ["═══ OmniRoute Doctor ═══", ""];
+				for (let i = 0; i < issues.length; i++) {
+					const issue = issues[i];
+					const icon = issue.severity === "error" ? "❌" : issue.severity === "warning" ? "⚠️" : "ℹ️";
+					const fixTag = issue.fix ? " [auto-fixable]" : "";
+					lines.push(`${icon} ${i + 1}. ${issue.message}${fixTag}`);
+					lines.push("");
+				}
+				ctx.ui.notify(lines.join("\n"), "info");
+
+				// Offer to auto-fix
+				const fixable = issues.filter((i) => i.fix);
+				if (fixable.length === 0) return;
+
+				const choice = await ctx.ui.select(
+					`${fixable.length} issue(s) can be auto-fixed. Proceed?`,
+					["Yes — fix all", "Pick individually", "No — skip"]
+				);
+
+				if (!choice || choice.startsWith("No")) return;
+
+				if (choice.startsWith("Yes")) {
+					const results: string[] = [];
+					for (const issue of fixable) {
+						try {
+							results.push(await issue.fix!());
+						} catch (e: any) {
+							results.push(`❌ Fix failed: ${e.message}`);
+						}
+					}
+					ctx.ui.notify(results.join("\n"), "info");
+					return;
+				}
+
+				// Pick individually
+				for (const issue of fixable) {
+					const apply = await ctx.ui.select(
+						issue.message,
+						["Fix this", "Skip"]
+					);
+					if (apply === "Fix this") {
+						try {
+							ctx.ui.notify(await issue.fix!(), "info");
+						} catch (e: any) {
+							ctx.ui.notify(`❌ Fix failed: ${e.message}`, "error");
+						}
+					}
+				}
+				return;
+			}
+
 			// ──────────────── /omni setup-key ────────────────
 
 			if (sub === "setup-key" || sub === "setupkey") {
@@ -1191,7 +1386,7 @@ export default function (pi: ExtensionAPI) {
 			// ──────────────── Unknown ────────────────
 
 			ctx.ui.notify(
-				`Unknown: /omni ${sub}\n\nAvailable: toggle, providers, add-provider, sync, log-review, setup-key, dashboard`,
+				`Unknown: /omni ${sub}\n\nAvailable: toggle, providers, add-provider, sync, log-review, doctor, setup-key, dashboard`,
 				"warning"
 			);
 		},
