@@ -221,6 +221,7 @@ function groupProviders(connections: Connection[], nodes: ProviderNode[]): Provi
 // ────────────────────────── call log (resolved model tracking) ──────────────────────────
 
 interface CallLog {
+	id: string;
 	model: string;
 	provider: string;
 	account: string;
@@ -306,6 +307,12 @@ function humanName(id: string): string {
 
 export default function (pi: ExtensionAPI) {
 	let healthInterval: ReturnType<typeof setInterval> | undefined;
+	let lastInputTime = 0; // ms timestamp of most recent user input turn
+
+	// Track when the user sends a message so we can correlate the call log
+	pi.on("input", () => {
+		lastInputTime = Date.now();
+	});
 
 	// ── Show resolved model in status bar after each response ──
 
@@ -314,10 +321,25 @@ export default function (pi: ExtensionAPI) {
 			const msg = event.message as any;
 			if (msg?.role !== "assistant") return;
 
-			// Brief delay for OmniRoute to write the call log entry
-			await new Promise((r) => setTimeout(r, 200));
+			// Poll for a call log entry that is newer than when this turn started.
+			// OmniRoute writes the log after the response stream closes, so we
+			// retry up to ~3 seconds rather than using a fixed one-shot delay.
+			const turnStart = lastInputTime || Date.now();
+			let log: CallLog | null = null;
 
-			const log = await getLastCallLog();
+			for (let attempt = 0; attempt < 10; attempt++) {
+				await new Promise((r) => setTimeout(r, 300));
+				const candidate = await getLastCallLog();
+				if (!candidate) break;
+
+				// Parse timestamp from log ID ("1775332387952-28" → ms epoch)
+				const logMs = parseInt(candidate.id?.split("-")[0] ?? "0", 10);
+				if (logMs >= turnStart) {
+					log = candidate;
+					break;
+				}
+			}
+
 			if (log) {
 				const combo = log.comboName ? `${log.comboName} → ` : "";
 				const acct = log.account ? ` · ${log.account}` : "";
