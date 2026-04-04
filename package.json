@@ -21,11 +21,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/oscarandrea/omniroute-pi-extension.git"
+    "url": "git+https://github.com/oscar-haha/omniroute-pi-extension.git"
   },
-  "homepage": "https://github.com/oscarandrea/omniroute-pi-extension#readme",
+  "homepage": "https://github.com/oscar-haha/omniroute-pi-extension#readme",
   "bugs": {
-    "url": "https://github.com/oscarandrea/omniroute-pi-extension/issues"
+    "url": "https://github.com/oscar-haha/omniroute-pi-extension/issues"
   },
   "peerDependencies": {
     "@mariozechner/pi-coding-agent": ">=0.60.0"
