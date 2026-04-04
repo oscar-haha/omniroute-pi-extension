@@ -792,8 +792,11 @@ export default function (pi: ExtensionAPI) {
 					config.providers.omni.models = allModels;
 					fs.writeFileSync(path, JSON.stringify(config, null, 2));
 
+					// Reload registry immediately — no restart needed
+					ctx.modelRegistry.refresh();
+
 					ctx.ui.notify(
-						`✅ Synced ${allModels.length} models to Ctrl+P (was ${oldCount})\n\nRestart pi or start a new session to pick up changes.`,
+						`✅ Synced ${allModels.length} models to Ctrl+P (was ${oldCount})`,
 						"info"
 					);
 				} catch (e: any) {
