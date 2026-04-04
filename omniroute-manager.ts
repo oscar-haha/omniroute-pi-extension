@@ -946,43 +946,90 @@ export default function (pi: ExtensionAPI) {
 
 					ctx.ui.notify(lines.join("\n"), "info");
 
-					// Offer to remove the always-failing models
 					if (removals.length === 0) return;
 
-					const confirmed = await ctx.ui.confirm(
-						"Remove broken models?",
-						`${removals.length} model(s) have 0% success rate:\n` +
-						removals.map((r) => `  • ${r.comboName}: ${r.modelId}`).join("\n") +
-						"\n\nRemove them from their combos?"
-					);
+					// Fetch all available models from OmniRoute once for replacement suggestions
+					let availableModels: string[] = [];
+					try {
+						const data = await api("/v1/models");
+						availableModels = (data?.data ?? []).map((m: any) =>
+							typeof m === "string" ? m : m.id
+						).filter(Boolean);
+					} catch {}
 
-					if (!confirmed) return;
+					// For each broken model, ask: remove or replace?
+					// Track pending edits: comboId → { remove: Set, add: string[] }
+					const edits = new Map<string, { id: string; name: string; remove: Set<string>; add: string[] }>();
 
-					// Group removals by combo
-					const byCombo = new Map<string, { id: string; name: string; remove: Set<string> }>();
 					for (const r of removals) {
-						if (!byCombo.has(r.comboId)) {
-							byCombo.set(r.comboId, { id: r.comboId, name: r.comboName, remove: new Set() });
+						// Models already in this combo (to avoid suggesting duplicates)
+						const currentCombo = combos.find((c) => c.id === r.comboId);
+						const alreadyIn = new Set(
+							(currentCombo?.models ?? []).map((m) =>
+								typeof m === "string" ? m : m.model
+							)
+						);
+
+						// Suggest models from the same provider prefix
+						const brokenPrefix = r.modelId.split("/")[0];
+						const suggestions = availableModels.filter(
+							(m) => m.startsWith(`${brokenPrefix}/`) && !alreadyIn.has(m) && m !== r.modelId
+						).slice(0, 8);
+
+						// Also offer models from other providers as alternatives
+						const otherSuggestions = availableModels.filter(
+							(m) => !m.startsWith(`${brokenPrefix}/`) && !alreadyIn.has(m)
+						).slice(0, 6);
+
+						const options = [
+							`❌ Remove (no replacement)`,
+							...(suggestions.length ? ["── Same provider ──", ...suggestions.map((m) => `→ ${m}`)] : []),
+							...(otherSuggestions.length ? ["── Other providers ──", ...otherSuggestions.map((m) => `→ ${m}`)] : []),
+							"⏭ Skip (keep as-is)",
+						];
+
+						const choice = await ctx.ui.select(
+							`[${r.comboName}] ${r.modelId} — remove or replace?`,
+							options
+						);
+
+						if (!choice || choice === "⏭ Skip (keep as-is)" || choice.startsWith("──")) continue;
+
+						if (!edits.has(r.comboId)) {
+							edits.set(r.comboId, { id: r.comboId, name: r.comboName, remove: new Set(), add: [] });
 						}
-						byCombo.get(r.comboId)!.remove.add(r.modelId);
+						const edit = edits.get(r.comboId)!;
+						edit.remove.add(r.modelId);
+
+						if (choice.startsWith("→ ")) {
+							edit.add.push(choice.slice(2));
+						}
+						// "Remove" → remove only, no add
 					}
 
+					if (edits.size === 0) return;
+
+					// Apply all edits
 					const allCombos = await listCombos();
 					const results: string[] = [];
 
-					for (const { id, name, remove } of byCombo.values()) {
+					for (const { id, name, remove, add } of edits.values()) {
 						const combo = allCombos.find((c) => c.id === id);
 						if (!combo) continue;
+
 						const kept = combo.models
 							.map((m) => (typeof m === "string" ? m : m.model))
 							.filter((m) => !remove.has(m));
+						const updated = [...kept, ...add];
 
 						try {
 							await api(`/api/combos/${id}`, {
 								method: "PUT",
-								body: JSON.stringify({ models: kept }),
+								body: JSON.stringify({ models: updated }),
 							});
-							results.push(`✅ ${name}: removed ${remove.size} model(s), ${kept.length} remaining`);
+							const removedList = [...remove].join(", ");
+							const addedList = add.length ? ` · added ${add.join(", ")}` : "";
+							results.push(`✅ ${name}: removed ${removedList}${addedList}`);
 						} catch (e: any) {
 							results.push(`❌ ${name}: ${e.message}`);
 						}
