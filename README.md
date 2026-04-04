@@ -20,7 +20,7 @@ A [Pi Coding Agent](https://github.com/badlogic/pi-mono/tree/main/packages/codin
 ```bash
 mkdir -p ~/.pi/agent/extensions
 curl -o ~/.pi/agent/extensions/omniroute-manager.ts \
-  https://raw.githubusercontent.com/oscarandrea/omniroute-pi-extension/main/omniroute-manager.ts
+  https://raw.githubusercontent.com/oscar-haha/omniroute-pi-extension/main/omniroute-manager.ts
 ```
 
 ### Option 2 — npm
