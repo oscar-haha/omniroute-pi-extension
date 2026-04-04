@@ -515,6 +515,7 @@ export default function (pi: ExtensionAPI) {
 
 						render(width: number): string[] {
 							const liveId = ctx.model?.id ?? "";
+							const total = combos.length + 1; // +1 for Done row
 							const lines: string[] = [];
 
 							lines.push(statusLine);
@@ -533,6 +534,10 @@ export default function (pi: ExtensionAPI) {
 								lines.push(cur ? `  ${YEL}▶${RST} ${label}` : `    ${label}`);
 							});
 
+							// Done row
+							const doneCur = sel === combos.length;
+							lines.push(doneCur ? `  ${YEL}▶${RST} ${DIM}── Done ──${RST}` : `    ${DIM}── Done ──${RST}`);
+
 							lines.push("");
 							if (busy) lines.push(`  ${DIM}working…${RST}`);
 
@@ -542,14 +547,16 @@ export default function (pi: ExtensionAPI) {
 						handleInput(data: string) {
 							if (busy) return;
 
+							const total = combos.length + 1; // +1 for Done row
+
 							// Navigation
 							if (data === "\x1b[A" || data === "\x1b[OA") { // up
-								sel = (sel - 1 + combos.length) % combos.length;
+								sel = (sel - 1 + total) % total;
 								tui.requestRender(true);
 								return;
 							}
 							if (data === "\x1b[B" || data === "\x1b[OB") { // down
-								sel = (sel + 1) % combos.length;
+								sel = (sel + 1) % total;
 								tui.requestRender(true);
 								return;
 							}
@@ -557,6 +564,12 @@ export default function (pi: ExtensionAPI) {
 							// Escape / q → close
 							if (data === "\x1b" || data === "q") {
 								done(null);
+								return;
+							}
+
+							// Done row selected
+							if (sel === combos.length) {
+								if (data === "\r" || data === "\n" || data === " ") done(null);
 								return;
 							}
 
