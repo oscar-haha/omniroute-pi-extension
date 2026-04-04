@@ -318,9 +318,12 @@ export default function (pi: ExtensionAPI) {
 			await new Promise((r) => setTimeout(r, 200));
 
 			const log = await getLastCallLog();
-			if (log && log.status === 200) {
+			if (log) {
 				const combo = log.comboName ? `${log.comboName} → ` : "";
-				ctx.ui.setStatus("omni", `${combo}${log.model} (${log.provider})`);
+				const acct = log.account ? ` · ${log.account}` : "";
+				const ok = log.status === 200;
+				const suffix = ok ? "" : ` ✗${log.status}`;
+				ctx.ui.setStatus("omni", `${combo}${log.model} (${log.provider}${acct})${suffix}`);
 			}
 		} catch {}
 	});
