@@ -54,32 +54,20 @@ function modelsJsonPath(): string {
 		: `${process.env.HOME}/.pi/agent/models.json`;
 }
 
-let _cachedApiKey: string | null = null;
 function getApiKey(): string {
-	if (_cachedApiKey !== null) return _cachedApiKey;
 	try {
 		const fs = require("fs");
 		const data = JSON.parse(fs.readFileSync(modelsJsonPath(), "utf8"));
-		_cachedApiKey = data?.providers?.omni?.apiKey || "";
+		return data?.providers?.omni?.apiKey || "";
 	} catch {
-		_cachedApiKey = "";
+		return "";
 	}
-	return _cachedApiKey;
-}
-/** Call after writing to models.json to pick up new key */
-function invalidateApiKeyCache(): void { _cachedApiKey = null; }
-
-function auth(): Record<string, string> {
-	const key = getApiKey();
-	return key
-		? { Authorization: `Bearer ${key}`, "Content-Type": "application/json" }
-		: { "Content-Type": "application/json" };
 }
 
 async function api(path: string, opts?: RequestInit): Promise<any> {
 	const res = await fetch(`${OMNI_URL}${path}`, {
 		...opts,
-		headers: { ...auth(), ...(opts?.headers || {}) },
+		headers: { "Content-Type": "application/json", ...(opts?.headers || {}) },
 		signal: AbortSignal.timeout(10000),
 	});
 	if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
@@ -237,15 +225,12 @@ async function pickModelsLoop(
 	allModels: { id: string; name: string }[],
 	currentModels: string[]
 ): Promise<string[] | null> {
-	const selected = new Set<string>(currentModels);
-
 	// Filter: only real models (must have provider/model format), skip combos
 	// Also deduplicate aliases — prefer short prefixes (cx/ over codex/, kr/ over kiro/)
 	const seen = new Map<string, string>(); // modelName → shortest prefixed ID
 	for (const m of allModels) {
-		if (!m.id.includes("/")) continue; // skip combos
-		const parts = m.id.split("/");
-		const modelName = parts.slice(1).join("/");
+		if (!m.id.includes("/")) continue;
+		const modelName = m.id.split("/").slice(1).join("/");
 		const existing = seen.get(modelName);
 		if (!existing || m.id.length < existing.length) {
 			seen.set(modelName, m.id);
@@ -253,22 +238,26 @@ async function pickModelsLoop(
 	}
 	const dedupedIds = new Set(seen.values());
 
-	// Group models by provider
-	const byProvider = new Map<string, string[]>();
+	// Build a map to normalize any alias to its canonical (shortest) form
+	const toCanonical = new Map<string, string>();
 	for (const m of allModels) {
 		if (!m.id.includes("/")) continue;
-		if (!dedupedIds.has(m.id)) continue;
-		const provider = m.id.split("/")[0];
-		if (!byProvider.has(provider)) byProvider.set(provider, []);
-		byProvider.get(provider)!.push(m.id);
+		const modelName = m.id.split("/").slice(1).join("/");
+		const canonical = seen.get(modelName);
+		if (canonical) toCanonical.set(m.id, canonical);
 	}
-	// Also keep any currently selected models that might use long-form aliases
-	for (const m of currentModels) {
-		if (!m.includes("/")) continue;
-		const provider = m.split("/")[0];
+
+	// Normalize currentModels to canonical form so ✅ marks show correctly
+	const selected = new Set<string>(
+		currentModels.map((m) => toCanonical.get(m) || m)
+	);
+
+	// Group models by provider
+	const byProvider = new Map<string, string[]>();
+	for (const id of dedupedIds) {
+		const provider = id.split("/")[0];
 		if (!byProvider.has(provider)) byProvider.set(provider, []);
-		const list = byProvider.get(provider)!;
-		if (!list.includes(m)) list.push(m);
+		byProvider.get(provider)!.push(id);
 	}
 	const providers = Array.from(byProvider.keys()).sort();
 
@@ -860,74 +849,108 @@ export default function (pi: ExtensionAPI) {
 					if (idx < 0 || idx >= combos.length) continue;
 					const combo = combos[idx];
 
-					const action = await ctx.ui.select(
-						`${combo.name} [${combo.strategy}]:`,
-						[
-							combo.isActive !== false ? "⬜ Disable" : "✅ Enable",
+					// Show current models + actions for this combo
+					let managingCombo = true;
+					while (managingCombo) {
+						// Refresh combo state
+						const refreshed = await listCombos();
+						const current = refreshed.find((c) => c.id === combo.id) || combo;
+						const currentModels = current.models.map((m) => typeof m === "string" ? m : m.model);
+
+						const opts = [
+							...currentModels.map((m) => `  ❌ Remove: ${m}`),
+							"  ➕ Add models from providers…",
+							"──────────",
+							current.isActive !== false ? "⬜ Disable combo" : "✅ Enable combo",
 							"🔴 Set as active model",
-							"✏️ Edit models",
-							"📋 Edit strategy",
+							`📋 Strategy: ${current.strategy}`,
 							"🗑️ Delete combo",
 							"← Back",
-						]
-					);
-					if (!action || action === "← Back") continue;
+						];
 
-					if (action.includes("Disable") || action.includes("Enable")) {
-						const newState = combo.isActive === false;
-						try {
-							await api(`/api/combos/${combo.id}`, {
-								method: "PUT",
-								body: JSON.stringify({ isActive: newState }),
-							});
-							ctx.ui.notify(`${combo.name} ${newState ? "enabled" : "disabled"}`, "info");
-						} catch (e: any) {
-							ctx.ui.notify(`Failed: ${e.message}`, "error");
+						const action = await ctx.ui.select(
+							`${current.name} [${current.strategy} · ${currentModels.length} models]:`,
+							opts
+						);
+						if (!action || action === "← Back") {
+							managingCombo = false;
+							continue;
 						}
-					} else if (action.includes("Set as active")) {
-						const model = ctx.modelRegistry.getAll().find((m) => m.id === combo.name);
-						if (!model) {
-							ctx.ui.notify(`"${combo.name}" not in model list — run /omni sync first`, "warning");
-						} else {
-							await pi.setModel(model);
-							ctx.ui.setStatus("omni", `🔴 ${combo.name}`);
-							ctx.ui.notify(`Active model → ${combo.name}`, "info");
-						}
-					} else if (action.includes("Edit models")) {
-						ctx.ui.notify("Syncing models from OmniRoute…", "info");
-						const allModels = await getAllModelsFromOmniRoute();
-						const currentModels = combo.models.map((m) => typeof m === "string" ? m : m.model);
-						const selected = await pickModelsLoop(ctx, allModels, currentModels);
-						if (!selected || selected.length === 0) continue;
-						try {
-							await api(`/api/combos/${combo.id}`, {
-								method: "PUT",
-								body: JSON.stringify({ models: selected }),
-							});
-							ctx.ui.notify(`✅ Updated "${combo.name}" — ${selected.length} models`, "info");
-						} catch (e: any) {
-							ctx.ui.notify(`Failed: ${e.message}`, "error");
-						}
-					} else if (action.includes("Edit strategy")) {
-						const strategy = await ctx.ui.select("Strategy:", ["priority", "round-robin", "random", "least-latency"]);
-						if (!strategy) continue;
-						try {
-							await api(`/api/combos/${combo.id}`, {
-								method: "PUT",
-								body: JSON.stringify({ strategy }),
-							});
-							ctx.ui.notify(`✅ "${combo.name}" strategy → ${strategy}`, "info");
-						} catch (e: any) {
-							ctx.ui.notify(`Failed: ${e.message}`, "error");
-						}
-					} else if (action.includes("Delete")) {
-						const confirm = await ctx.ui.select(`Delete "${combo.name}"? This cannot be undone.`, ["Yes — delete", "No — cancel"]);
-						if (confirm?.startsWith("Yes")) {
+
+						if (action === "──────────") continue;
+
+						if (action.startsWith("  ❌ Remove:")) {
+							const modelToRemove = action.replace("  ❌ Remove: ", "");
+							const updated = currentModels.filter((m) => m !== modelToRemove);
+							if (updated.length === 0) {
+								ctx.ui.notify("Can't remove the last model — delete the combo instead.", "warning");
+								continue;
+							}
 							try {
-								await api(`/api/combos/${combo.id}`, { method: "DELETE" });
-								ctx.ui.notify(`Deleted "${combo.name}"`, "info");
+								await api(`/api/combos/${current.id}`, {
+									method: "PUT",
+									body: JSON.stringify({ models: updated }),
+								});
+								ctx.ui.notify(`Removed ${modelToRemove}`, "info");
 							} catch (e: any) {
 								ctx.ui.notify(`Failed: ${e.message}`, "error");
+							}
+						} else if (action.includes("Add models")) {
+							ctx.ui.notify("Syncing models from OmniRoute…", "info");
+							const allModels = await getAllModelsFromOmniRoute();
+							const selected = await pickModelsLoop(ctx, allModels, currentModels);
+							if (!selected || selected.length === 0) continue;
+							try {
+								await api(`/api/combos/${current.id}`, {
+									method: "PUT",
+									body: JSON.stringify({ models: selected }),
+								});
+								ctx.ui.notify(`✅ Updated "${current.name}" — ${selected.length} models`, "info");
+							} catch (e: any) {
+								ctx.ui.notify(`Failed: ${e.message}`, "error");
+							}
+						} else if (action.includes("Disable") || action.includes("Enable")) {
+							const newState = current.isActive === false;
+							try {
+								await api(`/api/combos/${current.id}`, {
+									method: "PUT",
+									body: JSON.stringify({ isActive: newState }),
+								});
+								ctx.ui.notify(`${current.name} ${newState ? "enabled" : "disabled"}`, "info");
+							} catch (e: any) {
+								ctx.ui.notify(`Failed: ${e.message}`, "error");
+							}
+						} else if (action.includes("Set as active")) {
+							const model = ctx.modelRegistry.getAll().find((m) => m.id === current.name);
+							if (!model) {
+								ctx.ui.notify(`"${current.name}" not in model list — run /omni sync first`, "warning");
+							} else {
+								await pi.setModel(model);
+								ctx.ui.setStatus("omni", `🔴 ${current.name}`);
+								ctx.ui.notify(`Active model → ${current.name}`, "info");
+							}
+						} else if (action.includes("Strategy")) {
+							const strategy = await ctx.ui.select("Strategy:", ["priority", "round-robin", "random", "least-latency"]);
+							if (!strategy) continue;
+							try {
+								await api(`/api/combos/${current.id}`, {
+									method: "PUT",
+									body: JSON.stringify({ strategy }),
+								});
+								ctx.ui.notify(`✅ "${current.name}" strategy → ${strategy}`, "info");
+							} catch (e: any) {
+								ctx.ui.notify(`Failed: ${e.message}`, "error");
+							}
+						} else if (action.includes("Delete")) {
+							const confirm = await ctx.ui.select(`Delete "${current.name}"? This cannot be undone.`, ["Yes — delete", "No — cancel"]);
+							if (confirm?.startsWith("Yes")) {
+								try {
+									await api(`/api/combos/${current.id}`, { method: "DELETE" });
+									ctx.ui.notify(`Deleted "${current.name}"`, "info");
+									managingCombo = false;
+								} catch (e: any) {
+									ctx.ui.notify(`Failed: ${e.message}`, "error");
+								}
 							}
 						}
 					}
@@ -1075,7 +1098,7 @@ export default function (pi: ExtensionAPI) {
 					const oldCount = config.providers.omni.models?.length || 0;
 					config.providers.omni.models = allModels;
 					fs.writeFileSync(path, JSON.stringify(config, null, 2));
-					invalidateApiKeyCache();
+	
 
 					// Reload registry immediately — no restart needed
 					ctx.modelRegistry.refresh();
@@ -1484,7 +1507,7 @@ export default function (pi: ExtensionAPI) {
 					}
 
 					fs.writeFileSync(path, JSON.stringify(config, null, 2));
-					invalidateApiKeyCache();
+	
 					ctx.ui.notify(
 						`✅ API key created and saved to models.json\n\n` +
 						`  Key: ${newKey.slice(0, 12)}…\n` +
