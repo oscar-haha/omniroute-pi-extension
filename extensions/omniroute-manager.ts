@@ -11,11 +11,10 @@
  *
  * Commands:
  *   /omni                  — Status dashboard: health, combos, provider issues
- *   /omni combos           — Manage combos: toggle, edit models, create, delete
- *   /omni providers        — Browse providers → drill into models
- *   /omni add-provider     — Add an OpenAI-compatible provider not built into OmniRoute
+ *   /omni combos           — Manage combos: edit models, create, delete
+ *   /omni providers        — Browse providers, models & add new ones
+ *   /omni health           — Call log analysis + config diagnostics & auto-fix
  *   /omni sync             — Sync all OmniRoute models to pi's Ctrl+P picker
- *   /omni doctor           — Diagnose & auto-fix common issues (conn: combos, missing projectId, etc.)
  *   /omni setup-key        — Create an OmniRoute API key and save it to models.json
  *   /omni dashboard        — Show OmniRoute web dashboard URL
  *
@@ -28,7 +27,7 @@
  *          "omni": {
  *            "baseUrl": "http://localhost:20128",
  *            "api": "anthropic-messages",
-            "apiKey": "YOUR_OMNIROUTE_API_KEY",
+ *            "apiKey": "YOUR_OMNIROUTE_API_KEY",
  *            "models": [...]
  *          }
  *        }
@@ -55,15 +54,20 @@ function modelsJsonPath(): string {
 		: `${process.env.HOME}/.pi/agent/models.json`;
 }
 
+let _cachedApiKey: string | null = null;
 function getApiKey(): string {
+	if (_cachedApiKey !== null) return _cachedApiKey;
 	try {
 		const fs = require("fs");
 		const data = JSON.parse(fs.readFileSync(modelsJsonPath(), "utf8"));
-		return data?.providers?.omni?.apiKey || "";
+		_cachedApiKey = data?.providers?.omni?.apiKey || "";
 	} catch {
-		return "";
+		_cachedApiKey = "";
 	}
+	return _cachedApiKey;
 }
+/** Call after writing to models.json to pick up new key */
+function invalidateApiKeyCache(): void { _cachedApiKey = null; }
 
 function auth(): Record<string, string> {
 	const key = getApiKey();
@@ -79,7 +83,9 @@ async function api(path: string, opts?: RequestInit): Promise<any> {
 		signal: AbortSignal.timeout(10000),
 	});
 	if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
-	return res.json();
+	const text = await res.text();
+	if (!text) return {};
+	return JSON.parse(text);
 }
 
 // ────────────────────────── health ──────────────────────────
@@ -90,17 +96,6 @@ async function checkOmniRouteHealth(): Promise<boolean> {
 		return res.ok;
 	} catch {
 		return false;
-	}
-}
-
-/** Check if OmniRoute has a password set */
-async function checkOmniRouteAuthStatus(): Promise<{ authenticated: boolean }> {
-	try {
-		const res = await fetch(`${OMNI_URL}/api/auth/status`, { signal: AbortSignal.timeout(3000) });
-		if (!res.ok) return { authenticated: true }; // Assume protected if status endpoint fails/missing
-		return await res.json();
-	} catch {
-		return { authenticated: true };
 	}
 }
 
@@ -236,7 +231,7 @@ function groupProviders(connections: Connection[], nodes: ProviderNode[]): Provi
 
 // ────────────────────────── model picker ──────────────────────────
 
-/** Multi-select model picker using ctx.ui.select in a loop. */
+/** Multi-select model picker with grouped browsing by provider. */
 async function pickModelsLoop(
 	ctx: any,
 	allModels: { id: string; name: string }[],
@@ -244,34 +239,90 @@ async function pickModelsLoop(
 ): Promise<string[] | null> {
 	const selected = new Set<string>(currentModels);
 
-	// Group models by provider for easier browsing
+	// Filter: only real models (must have provider/model format), skip combos
+	// Also deduplicate aliases — prefer short prefixes (cx/ over codex/, kr/ over kiro/)
+	const seen = new Map<string, string>(); // modelName → shortest prefixed ID
+	for (const m of allModels) {
+		if (!m.id.includes("/")) continue; // skip combos
+		const parts = m.id.split("/");
+		const modelName = parts.slice(1).join("/");
+		const existing = seen.get(modelName);
+		if (!existing || m.id.length < existing.length) {
+			seen.set(modelName, m.id);
+		}
+	}
+	const dedupedIds = new Set(seen.values());
+
+	// Group models by provider
 	const byProvider = new Map<string, string[]>();
 	for (const m of allModels) {
-		const provider = m.id.includes("/") ? m.id.split("/")[0] : "combos";
+		if (!m.id.includes("/")) continue;
+		if (!dedupedIds.has(m.id)) continue;
+		const provider = m.id.split("/")[0];
 		if (!byProvider.has(provider)) byProvider.set(provider, []);
 		byProvider.get(provider)!.push(m.id);
 	}
+	// Also keep any currently selected models that might use long-form aliases
+	for (const m of currentModels) {
+		if (!m.includes("/")) continue;
+		const provider = m.split("/")[0];
+		if (!byProvider.has(provider)) byProvider.set(provider, []);
+		const list = byProvider.get(provider)!;
+		if (!list.includes(m)) list.push(m);
+	}
+	const providers = Array.from(byProvider.keys()).sort();
 
 	let picking = true;
 	while (picking) {
-		const current = selected.size > 0
-			? `Selected (${selected.size}): ${Array.from(selected).slice(0, 4).join(", ")}${selected.size > 4 ? " +" + (selected.size - 4) : ""}`
-			: "No models selected yet";
+		const summary = selected.size > 0
+			? Array.from(selected).join(", ")
+			: "(none)";
 
-		const opts = [
-			`── Done (${selected.size} models) ──`,
-			...allModels.map((m) => `${selected.has(m.id) ? "✅" : "⬜"} ${m.id}`),
+		// Top-level: pick a provider to browse, or finish
+		const providerOpts = [
+			`── Done (${selected.size} models selected) ──`,
+			...providers.map((p) => {
+				const models = byProvider.get(p)!;
+				const count = models.filter((m) => selected.has(m)).length;
+				const tag = count > 0 ? ` [${count} selected]` : "";
+				return `${p}/ (${models.length} models)${tag}`;
+			}),
 		];
 
-		const choice = await ctx.ui.select(current, opts);
-		if (!choice || choice.startsWith("── Done")) {
+		const providerPick = await ctx.ui.select(`Models: ${summary}`, providerOpts);
+		if (!providerPick || providerPick.startsWith("── Done")) {
 			picking = false;
-		} else {
-			const modelId = choice.replace(/^[✅⬜] /, "");
-			if (selected.has(modelId)) {
-				selected.delete(modelId);
+			continue;
+		}
+
+		// Extract provider name from "provider/ (N models) [X selected]"
+		const providerName = providerPick.split("/")[0];
+		const models = byProvider.get(providerName);
+		if (!models) continue;
+
+		// Browse models within this provider
+		let browsingProvider = true;
+		while (browsingProvider) {
+			const modelOpts = [
+				"← Back to providers",
+				...models.map((m) => `${selected.has(m) ? "✅" : "⬜"} ${m}`),
+			];
+
+			const selectedCount = models.filter((m) => selected.has(m)).length;
+			const modelPick = await ctx.ui.select(
+				`${providerName}/ — ${selectedCount}/${models.length} selected`,
+				modelOpts
+			);
+
+			if (!modelPick || modelPick === "← Back to providers") {
+				browsingProvider = false;
 			} else {
-				selected.add(modelId);
+				const modelId = modelPick.replace(/^[✅⬜] /, "");
+				if (selected.has(modelId)) {
+					selected.delete(modelId);
+				} else {
+					selected.add(modelId);
+				}
 			}
 		}
 	}
@@ -339,15 +390,7 @@ function findMissingProjectIds(connections: Connection[]): DoctorIssue[] {
 			(healthy.length > 0
 				? `${healthy.length} other antigravity account(s) are healthy. `
 				: `Consider using Gemini AI Studio (API key) instead — it doesn't need a projectId. `) +
-			`Reconnect in dashboard, or deprioritize this account.`,
-		fix: async () => {
-			// Set priority to 99 so healthy accounts are tried first
-			await api(`/api/providers/${c.id}`, {
-				method: "PATCH",
-				body: JSON.stringify({ priority: 99 }),
-			});
-			return `✅ Deprioritized "${c.name}" (priority → 99). Healthy accounts will be used first.`;
-		},
+			`Reconnect in dashboard: ${DASHBOARD_URL} → Providers → disconnect & reconnect.`,
 	}));
 }
 
@@ -578,16 +621,14 @@ export default function (pi: ExtensionAPI) {
 			const msg = event.message as any;
 			if (msg?.role !== "assistant") return;
 
-			// Poll until we see a NEW call log entry (one we haven't shown yet).
-			// This avoids any timestamp comparison issues — we simply wait for
-			// the log ID to change. Max ~4.5 seconds (15 × 300 ms).
+			// Wait briefly for OmniRoute to log the call, then check.
+			// Two attempts: 500ms and 1500ms. Avoids the old 15×300ms poll loop.
 			let log: CallLog | null = null;
 
-			for (let attempt = 0; attempt < 15; attempt++) {
-				await new Promise((r) => setTimeout(r, 300));
+			for (const delay of [500, 1000]) {
+				await new Promise((r) => setTimeout(r, delay));
 				const candidate = await getLastCallLog();
-				if (!candidate) break;
-				if (candidate.id !== lastSeenLogId) {
+				if (candidate && candidate.id !== lastSeenLogId) {
 					log = candidate;
 					break;
 				}
@@ -634,7 +675,6 @@ export default function (pi: ExtensionAPI) {
 	// ── Startup: health check + disconnected provider warnings ──
 
 	pi.on("session_start", async (_event, ctx) => {
-		ctx.ui.notify("OmniRoute extension loaded (v1.0.1)", "info");
 		const healthy = await checkOmniRouteHealth();
 		ctx.ui.setStatus("omni", healthy ? "OmniRoute ✓" : "OmniRoute ✗");
 
@@ -663,6 +703,7 @@ export default function (pi: ExtensionAPI) {
 				...checkApiKey(),
 
 				...findConnPrefixedCombos(combos, conns),
+				...findEmptyCombos(combos),
 				...findFragileCombos(combos, conns),
 				...findMissingProjectIds(conns),
 				...findExpiringAccounts(conns),
@@ -700,9 +741,9 @@ export default function (pi: ExtensionAPI) {
 	// ── /omni command ──
 
 	pi.registerCommand("omni", {
-		description: "OmniRoute: /omni [combos|providers|add-provider|sync|log-review|doctor|setup-key|dashboard]",
+		description: "OmniRoute: /omni [combos|providers|health|sync|setup-key|dashboard]",
 		getArgumentCompletions(prefix: string) {
-			return ["combos", "toggle", "providers", "add-provider", "sync", "log-review", "doctor", "setup-key", "dashboard"]
+			return ["combos", "providers", "health", "sync", "setup-key", "dashboard"]
 				.filter((s) => s.startsWith(prefix))
 				.map((s) => ({ value: s, label: s }));
 		},
@@ -752,12 +793,10 @@ export default function (pi: ExtensionAPI) {
 					"",
 					"─── Commands ───",
 					"",
-					"  /omni combos          Manage combos: toggle, edit, create, delete",
-					"  /omni providers       Browse providers & models",
-					"  /omni add-provider    Add OpenAI-compatible provider",
+					"  /omni combos          Manage combos: edit, create, delete",
+					"  /omni providers       Browse providers, models & add new ones",
+					"  /omni health          Call log analysis + config diagnostics & auto-fix",
 					"  /omni sync            Sync models to Ctrl+P picker",
-					"  /omni log-review      Analyse call logs · remove broken models",
-					"  /omni doctor          Diagnose & auto-fix common issues",
 					"  /omni setup-key       Create OmniRoute API key & save to models.json",
 					"  /omni dashboard       Dashboard URL",
 				);
@@ -767,9 +806,9 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			// ──────────────── /omni combos (also: toggle) ────────────────
+			// ──────────────── /omni combos ────────────────
 
-			if (sub === "combos" || sub === "toggle") {
+			if (sub === "combos") {
 				let browsing = true;
 				while (browsing) {
 					const combos = await listCombos();
@@ -912,6 +951,7 @@ export default function (pi: ExtensionAPI) {
 					const statusEmoji = hasErrors ? "❌" : activeCount === totalCount ? "✅" : activeCount > 0 ? "⚠️" : "⬜";
 					return `${statusEmoji} ${g.displayName}${prefixStr}  [${activeCount}/${totalCount} active]`;
 				});
+				providerOptions.push("── Add OpenAI-compatible provider ──");
 				providerOptions.push("── Back ──");
 
 				let browsing = true;
@@ -919,6 +959,33 @@ export default function (pi: ExtensionAPI) {
 					const choice = await ctx.ui.select("Select a provider to see details:", providerOptions);
 					if (!choice || choice === "── Back ──") {
 						browsing = false;
+						continue;
+					}
+
+					if (choice === "── Add OpenAI-compatible provider ──") {
+						const name = await ctx.ui.input("Provider name", "e.g. Together, Fireworks");
+						if (!name) continue;
+						const prefix = await ctx.ui.input("Short prefix (used as prefix/model-name)", "e.g. tog, fw");
+						if (!prefix) continue;
+						const baseUrl = await ctx.ui.input("Base URL (OpenAI-compatible /v1 endpoint)");
+						if (!baseUrl) continue;
+						const apiKey = await ctx.ui.input("API key");
+						if (!apiKey) continue;
+						try {
+							const nodeRes = await api("/api/provider-nodes", {
+								method: "POST",
+								body: JSON.stringify({ name, prefix, apiType: "chat", baseUrl, type: "openai-compatible" }),
+							});
+							const nodeId = nodeRes?.node?.id;
+							if (!nodeId) throw new Error("No node ID returned");
+							await api("/api/providers", {
+								method: "POST",
+								body: JSON.stringify({ provider: nodeId, apiKey, name: `${name} API Key` }),
+							});
+							ctx.ui.notify(`✅ Added: ${name} (${prefix}/)\nRun /omni sync to add models to Ctrl+P`, "info");
+						} catch (e: any) {
+							ctx.ui.notify(`Failed: ${e.message}`, "error");
+						}
 						continue;
 					}
 
@@ -985,66 +1052,6 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			// ──────────────── /omni add-provider ────────────────
-
-			if (sub === "add-provider") {
-				ctx.ui.notify(
-					"This adds an OpenAI-compatible provider that isn't built into OmniRoute.\n" +
-					"For built-in providers (Gemini, Groq, etc.), use the dashboard instead.",
-					"info"
-				);
-
-				const name = await ctx.ui.input("Provider name", "e.g. OpenAdapter, Together, Fireworks");
-				if (!name) return;
-
-				const prefix = await ctx.ui.input(
-					"Short prefix (used as prefix/model-name)",
-					"e.g. oa, tog, fw"
-				);
-				if (!prefix) return;
-
-				const baseUrl = await ctx.ui.input(
-					"Base URL (OpenAI-compatible /v1 endpoint)",
-					"e.g. https://api.openadapter.in/v1"
-				);
-				if (!baseUrl) return;
-
-				const apiKey = await ctx.ui.input("API key", "sk-...");
-				if (!apiKey) return;
-
-				try {
-					const nodeRes = await api("/api/provider-nodes", {
-						method: "POST",
-						body: JSON.stringify({
-							name,
-							prefix,
-							apiType: "chat",
-							baseUrl,
-							type: "openai-compatible",
-						}),
-					});
-					const nodeId = nodeRes?.node?.id;
-					if (!nodeId) throw new Error("No node ID returned");
-
-					await api("/api/providers", {
-						method: "POST",
-						body: JSON.stringify({
-							provider: nodeId,
-							apiKey,
-							name: `${name} API Key`,
-						}),
-					});
-
-					ctx.ui.notify(
-						`✅ Added: ${name} (${prefix}/)\nModels available as ${prefix}/<model-name>\n\nRun /omni sync to add models to Ctrl+P`,
-						"info"
-					);
-				} catch (e: any) {
-					ctx.ui.notify(`Failed: ${e.message}`, "error");
-				}
-				return;
-			}
-
 			// ──────────────── /omni sync ────────────────
 
 			if (sub === "sync") {
@@ -1068,6 +1075,7 @@ export default function (pi: ExtensionAPI) {
 					const oldCount = config.providers.omni.models?.length || 0;
 					config.providers.omni.models = allModels;
 					fs.writeFileSync(path, JSON.stringify(config, null, 2));
+					invalidateApiKeyCache();
 
 					// Reload registry immediately — no restart needed
 					ctx.modelRegistry.refresh();
@@ -1082,10 +1090,10 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			// ──────────────── /omni log-review ────────────────
+			// ──────────────── /omni health (merged log-review + doctor) ────────────────
 
-			if (sub === "log-review" || sub === "logreview") {
-				ctx.ui.notify("Fetching call logs…", "info");
+			if (sub === "health" || sub === "log-review" || sub === "logreview" || sub === "doctor" || sub === "doc") {
+				ctx.ui.notify("Running health check…", "info");
 
 				try {
 					const [combos, rawLogs] = await Promise.all([
@@ -1140,19 +1148,30 @@ export default function (pi: ExtensionAPI) {
 						}
 					}
 
-					// Match a combo model ID (prefix/model) to a call log stats key.
-					// OmniRoute logs use the full provider name (e.g. "kiro"), combos use
-					// short prefixes (e.g. "kr"). Match by the model name portion instead.
+					// Known prefix aliases: short combo prefix → full OmniRoute log provider name
+					const prefixMap: Record<string, string> = {
+						cx: "codex", kr: "kiro", kmc: "kimi-coding", qw: "qwen", ali: "alibaba",
+					};
+
+					// Match a combo model ID to call log stats.
+					// Tries exact match first, then resolves prefix aliases.
 					const findStats = (modelId: string): ModelStats | undefined => {
+						// Exact match
+						if (stats.has(modelId)) return stats.get(modelId);
+						// Resolve alias: cx/gpt-5.4 → codex/gpt-5.4
+						const prefix = modelId.split("/")[0];
 						const modelName = modelId.split("/").slice(1).join("/");
-						// First try exact prefix match
-						for (const [key, s] of stats) {
-							const logModelName = key.split("/").slice(1).join("/");
-							if (logModelName === modelName) return s;
+						const longPrefix = prefixMap[prefix];
+						if (longPrefix) {
+							const aliased = `${longPrefix}/${modelName}`;
+							if (stats.has(aliased)) return stats.get(aliased);
 						}
-						// Fallback: partial suffix match (handles nested paths)
-						for (const [key, s] of stats) {
-							if (key.endsWith(`/${modelName}`) || key === modelName) return s;
+						// Reverse alias: codex/gpt-5.4 → check if logged as cx/gpt-5.4
+						for (const [short, long] of Object.entries(prefixMap)) {
+							if (prefix === long) {
+								const aliased = `${short}/${modelName}`;
+								if (stats.has(aliased)) return stats.get(aliased);
+							}
 						}
 						return undefined;
 					};
@@ -1302,77 +1321,59 @@ export default function (pi: ExtensionAPI) {
 				} catch (e: any) {
 					ctx.ui.notify(`Log review failed: ${e.message}`, "error");
 				}
-				return;
-			}
 
-			// ──────────────── /omni doctor ────────────────
+				// ── Config diagnostics (formerly /omni doctor) ──
+				ctx.ui.notify("Running config diagnostics…", "info");
+				try {
+					const [dCombos, dConns] = await Promise.all([listCombos(), listConnections()]);
+					const issues = [
+						...checkApiKey(),
+						...findConnPrefixedCombos(dCombos, dConns),
+						...findEmptyCombos(dCombos),
+						...findFragileCombos(dCombos, dConns),
+						...findMissingProjectIds(dConns),
+						...findExpiringAccounts(dConns),
+					];
 
-			if (sub === "doctor" || sub === "doc") {
-				ctx.ui.notify("Running diagnostics…", "info");
+					if (issues.length === 0) {
+						ctx.ui.notify("✅ Config diagnostics: no issues found.", "info");
+					} else {
+						const diagLines = ["═══ Config Diagnostics ═══", ""];
+						for (let i = 0; i < issues.length; i++) {
+							const issue = issues[i];
+							const icon = issue.severity === "error" ? "❌" : issue.severity === "warning" ? "⚠️" : "ℹ️";
+							const fixTag = issue.fix ? " [auto-fixable]" : "";
+							diagLines.push(`${icon} ${i + 1}. ${issue.message}${fixTag}`);
+							diagLines.push("");
+						}
+						ctx.ui.notify(diagLines.join("\n"), "info");
 
-				const [combos, conns] = await Promise.all([listCombos(), listConnections()]);
-				const issues = [
-					...checkApiKey(),
-	
-					...findConnPrefixedCombos(combos, conns),
-					...findFragileCombos(combos, conns),
-					...findMissingProjectIds(conns),
-					...findExpiringAccounts(conns),
-				];
-
-				if (issues.length === 0) {
-					ctx.ui.notify("✅ No issues found — everything looks healthy.", "info");
-					return;
-				}
-
-				// Display all issues
-				const lines = ["═══ OmniRoute Doctor ═══", ""];
-				for (let i = 0; i < issues.length; i++) {
-					const issue = issues[i];
-					const icon = issue.severity === "error" ? "❌" : issue.severity === "warning" ? "⚠️" : "ℹ️";
-					const fixTag = issue.fix ? " [auto-fixable]" : "";
-					lines.push(`${icon} ${i + 1}. ${issue.message}${fixTag}`);
-					lines.push("");
-				}
-				ctx.ui.notify(lines.join("\n"), "info");
-
-				// Offer to auto-fix
-				const fixable = issues.filter((i) => i.fix);
-				if (fixable.length === 0) return;
-
-				const choice = await ctx.ui.select(
-					`${fixable.length} issue(s) can be auto-fixed. Proceed?`,
-					["Yes — fix all", "Pick individually", "No — skip"]
-				);
-
-				if (!choice || choice.startsWith("No")) return;
-
-				if (choice.startsWith("Yes")) {
-					const results: string[] = [];
-					for (const issue of fixable) {
-						try {
-							results.push(await issue.fix!());
-						} catch (e: any) {
-							results.push(`❌ Fix failed: ${e.message}`);
+						const fixable = issues.filter((i) => i.fix);
+						if (fixable.length > 0) {
+							const fixChoice = await ctx.ui.select(
+								`${fixable.length} issue(s) can be auto-fixed. Proceed?`,
+								["Yes — fix all", "Pick individually", "No — skip"]
+							);
+							if (fixChoice?.startsWith("Yes")) {
+								const fixResults: string[] = [];
+								for (const issue of fixable) {
+									try { fixResults.push(await issue.fix!()); }
+									catch (e: any) { fixResults.push(`❌ Fix failed: ${e.message}`); }
+								}
+								ctx.ui.notify(fixResults.join("\n"), "info");
+							} else if (fixChoice === "Pick individually") {
+								for (const issue of fixable) {
+									const apply = await ctx.ui.select(issue.message, ["Fix this", "Skip"]);
+									if (apply === "Fix this") {
+										try { ctx.ui.notify(await issue.fix!(), "info"); }
+										catch (e: any) { ctx.ui.notify(`❌ Fix failed: ${e.message}`, "error"); }
+									}
+								}
+							}
 						}
 					}
-					ctx.ui.notify(results.join("\n"), "info");
-					return;
-				}
-
-				// Pick individually
-				for (const issue of fixable) {
-					const apply = await ctx.ui.select(
-						issue.message,
-						["Fix this", "Skip"]
-					);
-					if (apply === "Fix this") {
-						try {
-							ctx.ui.notify(await issue.fix!(), "info");
-						} catch (e: any) {
-							ctx.ui.notify(`❌ Fix failed: ${e.message}`, "error");
-						}
-					}
+				} catch (e: any) {
+					ctx.ui.notify(`Diagnostics failed: ${e.message}`, "error");
 				}
 				return;
 			}
@@ -1483,6 +1484,7 @@ export default function (pi: ExtensionAPI) {
 					}
 
 					fs.writeFileSync(path, JSON.stringify(config, null, 2));
+					invalidateApiKeyCache();
 					ctx.ui.notify(
 						`✅ API key created and saved to models.json\n\n` +
 						`  Key: ${newKey.slice(0, 12)}…\n` +
@@ -1524,7 +1526,7 @@ export default function (pi: ExtensionAPI) {
 			// ──────────────── Unknown ────────────────
 
 			ctx.ui.notify(
-				`Unknown: /omni ${sub}\n\nAvailable: combos, providers, add-provider, sync, log-review, doctor, setup-key, dashboard`,
+				`Unknown: /omni ${sub}\n\nAvailable: combos, providers, health, sync, setup-key, dashboard`,
 				"warning"
 			);
 		},
