@@ -42,9 +42,48 @@
  */
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { spawn as nodeSpawn } from "child_process";
+import { existsSync } from "fs";
+import { join } from "path";
+import { homedir } from "os";
 
 const OMNI_URL = process.env.OMNIROUTE_URL || "http://127.0.0.1:20128";
 const DASHBOARD_URL = process.env.OMNIROUTE_DASHBOARD || "http://localhost:20128";
+
+// ────────────────────────── auto-start ──────────────────────────
+
+const OMNIROUTE_BIN = join(
+	homedir(),
+	".local", "node", "lib", "node_modules", "omniroute", "bin", "omniroute.mjs"
+);
+
+/**
+ * Start OmniRoute as a detached background process.
+ * Returns true if spawned, false if the binary wasn't found.
+ */
+function startOmniRoute(): boolean {
+	if (!existsSync(OMNIROUTE_BIN)) return false;
+
+	const child = nodeSpawn(process.execPath, [OMNIROUTE_BIN, "--no-open"], {
+		detached: true,
+		stdio: "ignore",
+		env: { ...process.env },
+	});
+	child.unref();
+	return true;
+}
+
+/**
+ * Wait for OmniRoute to become healthy, polling up to a timeout.
+ */
+async function waitForHealthy(timeoutMs = 15_000, intervalMs = 1_000): Promise<boolean> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (await checkOmniRouteHealth()) return true;
+		await new Promise((r) => setTimeout(r, intervalMs));
+	}
+	return false;
+}
 
 // ────────────────────────── helpers ──────────────────────────
 
@@ -712,7 +751,31 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 		} else {
-			ctx.ui.notify(`OmniRoute not responding at ${OMNI_URL}`, "warning");
+			// OmniRoute isn't running — try to start it automatically
+			if (existsSync(OMNIROUTE_BIN)) {
+				ctx.ui.notify("OmniRoute not running — starting it now…", "info");
+				const spawned = startOmniRoute();
+				if (spawned) {
+					ctx.ui.setStatus("omni", "OmniRoute ⏳");
+					const came_up = await waitForHealthy();
+					if (came_up) {
+						ctx.ui.setStatus("omni", "OmniRoute ✓");
+						ctx.ui.notify("OmniRoute started successfully.", "info");
+					} else {
+						ctx.ui.setStatus("omni", "OmniRoute ✗");
+						ctx.ui.notify(
+							`OmniRoute was started but didn't respond within 15s.\nCheck logs or try manually: omniroute`,
+							"error"
+						);
+					}
+				}
+			} else {
+				ctx.ui.setStatus("omni", "OmniRoute ✗");
+				ctx.ui.notify(
+					`OmniRoute is not installed.\n\nInstall it with:\n  npm install -g omniroute\n\nThen restart pi, or run 'omniroute' in a separate terminal.`,
+					"warning"
+				);
+			}
 		}
 
 		// Periodic health check — only update status if OmniRoute goes down
