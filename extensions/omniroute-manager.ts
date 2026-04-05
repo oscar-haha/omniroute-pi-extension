@@ -28,7 +28,7 @@
  *          "omni": {
  *            "baseUrl": "http://localhost:20128",
  *            "api": "anthropic-messages",
- *            "apiKey": "YOUR_OMNIROUTE_API_KEY",
+            "apiKey": "YOUR_OMNIROUTE_API_KEY",
  *            "models": [...]
  *          }
  *        }
@@ -90,6 +90,17 @@ async function checkOmniRouteHealth(): Promise<boolean> {
 		return res.ok;
 	} catch {
 		return false;
+	}
+}
+
+/** Check if OmniRoute has a password set */
+async function checkOmniRouteAuthStatus(): Promise<{ authenticated: boolean }> {
+	try {
+		const res = await fetch(`${OMNI_URL}/api/auth/status`, { signal: AbortSignal.timeout(3000) });
+		if (!res.ok) return { authenticated: true }; // Assume protected if status endpoint fails/missing
+		return await res.json();
+	} catch {
+		return { authenticated: true };
 	}
 }
 
@@ -375,19 +386,14 @@ function findFragileCombos(combos: Combo[], connections: Connection[]): DoctorIs
 	return issues;
 }
 
-/** Check if the pi models.json API key looks invalid */
+/** Check if the pi models.json API key is configured (info-level only — OmniRoute
+ *  doesn't enforce keys on the Anthropic /v1/messages endpoint that pi uses). */
 function checkApiKey(): DoctorIssue[] {
 	const key = getApiKey();
 	if (!key) {
 		return [{
-			severity: "error",
-			message: `No API key configured in models.json. Run /omni setup-key to create one.`,
-		}];
-	}
-	if (!key.startsWith("omni-") || key.length < 10) {
-		return [{
-			severity: "warning",
-			message: `API key "${key}" doesn't look like a valid OmniRoute key (expected "omni-…"). Run /omni setup-key to create a proper one.`,
+			severity: "info",
+			message: `No API key in models.json. This is fine for the /v1/messages endpoint pi uses.`,
 		}];
 	}
 	return [];
@@ -584,6 +590,7 @@ export default function (pi: ExtensionAPI) {
 	// ── Startup: health check + disconnected provider warnings ──
 
 	pi.on("session_start", async (_event, ctx) => {
+		ctx.ui.notify("OmniRoute extension loaded (v1.0.1)", "info");
 		const healthy = await checkOmniRouteHealth();
 		ctx.ui.setStatus("omni", healthy ? "OmniRoute ✓" : "OmniRoute ✗");
 
@@ -610,6 +617,7 @@ export default function (pi: ExtensionAPI) {
 			// Proactive diagnostics on startup
 			const issues = [
 				...checkApiKey(),
+
 				...findConnPrefixedCombos(combos, conns),
 				...findFragileCombos(combos, conns),
 				...findMissingProjectIds(conns),
@@ -1287,6 +1295,7 @@ export default function (pi: ExtensionAPI) {
 				const [combos, conns] = await Promise.all([listCombos(), listConnections()]);
 				const issues = [
 					...checkApiKey(),
+	
 					...findConnPrefixedCombos(combos, conns),
 					...findFragileCombos(combos, conns),
 					...findMissingProjectIds(conns),
@@ -1464,7 +1473,7 @@ export default function (pi: ExtensionAPI) {
 						"info"
 					);
 				} catch (e: any) {
-					// Key was created but couldn't save — show it so user doesn't lose it
+					// Key was created but couldn\'t save — show it so user doesn\'t lose it
 					ctx.ui.notify(
 						`⚠️ Key created but failed to save to models.json: ${e.message}\n\n` +
 						`  Your key: ${newKey}\n\n` +
