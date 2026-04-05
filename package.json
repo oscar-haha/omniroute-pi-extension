@@ -1,6 +1,6 @@
 {
   "name": "omniroute-pi-extension",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Pi Coding Agent extension for OmniRoute — manage combos, browse providers, and see which model actually served each response in the status bar",
   "keywords": [
     "pi-package",
