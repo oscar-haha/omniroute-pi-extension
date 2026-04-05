@@ -11,7 +11,7 @@
  *
  * Commands:
  *   /omni                  — Status dashboard: health, combos, provider issues
- *   /omni toggle           — Toggle combos on/off interactively
+ *   /omni combos           — Manage combos: toggle, edit models, create, delete
  *   /omni providers        — Browse providers → drill into models
  *   /omni add-provider     — Add an OpenAI-compatible provider not built into OmniRoute
  *   /omni sync             — Sync all OmniRoute models to pi's Ctrl+P picker
@@ -232,6 +232,50 @@ function groupProviders(connections: Connection[], nodes: ProviderNode[]): Provi
 	}
 
 	return Array.from(groups.values()).sort((a, b) => a.displayName.localeCompare(b.displayName));
+}
+
+// ────────────────────────── model picker ──────────────────────────
+
+/** Multi-select model picker using ctx.ui.select in a loop. */
+async function pickModelsLoop(
+	ctx: any,
+	allModels: { id: string; name: string }[],
+	currentModels: string[]
+): Promise<string[] | null> {
+	const selected = new Set<string>(currentModels);
+
+	// Group models by provider for easier browsing
+	const byProvider = new Map<string, string[]>();
+	for (const m of allModels) {
+		const provider = m.id.includes("/") ? m.id.split("/")[0] : "combos";
+		if (!byProvider.has(provider)) byProvider.set(provider, []);
+		byProvider.get(provider)!.push(m.id);
+	}
+
+	let picking = true;
+	while (picking) {
+		const current = selected.size > 0
+			? `Selected (${selected.size}): ${Array.from(selected).slice(0, 4).join(", ")}${selected.size > 4 ? " +" + (selected.size - 4) : ""}`
+			: "No models selected yet";
+
+		const opts = [
+			`── Done (${selected.size} models) ──`,
+			...allModels.map((m) => `${selected.has(m.id) ? "✅" : "⬜"} ${m.id}`),
+		];
+
+		const choice = await ctx.ui.select(current, opts);
+		if (!choice || choice.startsWith("── Done")) {
+			picking = false;
+		} else {
+			const modelId = choice.replace(/^[✅⬜] /, "");
+			if (selected.has(modelId)) {
+				selected.delete(modelId);
+			} else {
+				selected.add(modelId);
+			}
+		}
+	}
+	return selected.size > 0 ? Array.from(selected) : null;
 }
 
 // ────────────────────────── doctor diagnostics ──────────────────────────
@@ -656,9 +700,9 @@ export default function (pi: ExtensionAPI) {
 	// ── /omni command ──
 
 	pi.registerCommand("omni", {
-		description: "OmniRoute: /omni [toggle|providers|add-provider|sync|log-review|doctor|setup-key|dashboard]",
+		description: "OmniRoute: /omni [combos|providers|add-provider|sync|log-review|doctor|setup-key|dashboard]",
 		getArgumentCompletions(prefix: string) {
-			return ["toggle", "providers", "add-provider", "sync", "log-review", "doctor", "setup-key", "dashboard"]
+			return ["combos", "toggle", "providers", "add-provider", "sync", "log-review", "doctor", "setup-key", "dashboard"]
 				.filter((s) => s.startsWith(prefix))
 				.map((s) => ({ value: s, label: s }));
 		},
@@ -708,7 +752,7 @@ export default function (pi: ExtensionAPI) {
 					"",
 					"─── Commands ───",
 					"",
-					"  /omni toggle          Toggle combos on/off · set active model",
+					"  /omni combos          Manage combos: toggle, edit, create, delete",
 					"  /omni providers       Browse providers & models",
 					"  /omni add-provider    Add OpenAI-compatible provider",
 					"  /omni sync            Sync models to Ctrl+P picker",
@@ -723,158 +767,132 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			// ──────────────── /omni toggle ────────────────
+			// ──────────────── /omni combos (also: toggle) ────────────────
 
-			if (sub === "toggle") {
-				const initial = await listCombos();
-				if (!initial.length) {
-					ctx.ui.notify(`No combos configured.\nCreate combos in the dashboard: ${DASHBOARD_URL}`, "warning");
-					return;
-				}
+			if (sub === "combos" || sub === "toggle") {
+				let browsing = true;
+				while (browsing) {
+					const combos = await listCombos();
+					const liveId = ctx.model?.id ?? "";
 
-				// ANSI helpers (no external imports needed)
-				const B  = "\x1b[1m";   // bold
-				const DIM = "\x1b[2m";  // dim
-				const RST = "\x1b[0m";  // reset
-				const GRN = "\x1b[32m"; // green
-				const YEL = "\x1b[33m"; // yellow
-				const RED = "\x1b[31m"; // red
-				const GRY = "\x1b[90m"; // dark grey
+					const options = combos.map((c) => {
+						const on = c.isActive !== false ? "✅" : "⬜";
+						const live = c.name === liveId ? " 🔴" : "";
+						const models = c.models.map((m) => typeof m === "string" ? m : m.model);
+						const preview = models.slice(0, 3).join(", ");
+						const more = models.length > 3 ? ` +${models.length - 3}` : "";
+						return `${on} ${c.name} [${c.strategy} · ${c.models.length}]${live}  →  ${preview}${more}`;
+					});
+					options.push("── New Combo ──");
+					options.push("── Done ──");
 
-				await ctx.ui.custom((tui: any, _theme: any, _kb: any, done: (r: null) => void) => {
-					let combos: Combo[] = initial.slice();
-					let sel = 0;
-					let statusLine = `${GRY}Space toggle · Enter set active · Esc done${RST}`;
-					let busy = false;
+					const pick = await ctx.ui.select("Combos — select to manage:", options);
+					if (!pick || pick === "── Done ──") {
+						browsing = false;
+						continue;
+					}
 
-					const refresh = () => {
-						listCombos().then((c) => {
-							combos = c;
-							tui.requestRender(true);
-						}).catch(() => {
-							tui.requestRender(true);
-						});
-					};
+					if (pick === "── New Combo ──") {
+						const name = await ctx.ui.input("Combo name:");
+						if (!name) continue;
+						const strategy = await ctx.ui.select("Strategy:", ["priority", "round-robin", "random", "least-latency"]);
+						if (!strategy) continue;
 
-					return {
-						invalidate() {},
+						// Sync models then pick
+						ctx.ui.notify("Syncing models from OmniRoute…", "info");
+						const allModels = await getAllModelsFromOmniRoute();
+						const selected = await pickModelsLoop(ctx, allModels, []);
+						if (!selected || selected.length === 0) continue;
 
-						render(width: number): string[] {
-							const liveId = ctx.model?.id ?? "";
-							const total = combos.length + 1; // +1 for Done row
-							const lines: string[] = [];
-
-							lines.push(statusLine);
-							lines.push("");
-
-							combos.forEach((c, i) => {
-								const on   = c.isActive !== false;
-								const live = c.name === liveId;
-								const cur  = i === sel;
-
-								const bullet = on ? `${GRN}✅${RST}` : `${GRY}⬜${RST}`;
-								const liveTag = live ? ` ${RED}🔴${RST}` : "";
-								const meta = `${GRY}[${c.strategy} · ${c.models.length}]${RST}`;
-								const label = `${bullet} ${cur ? B : ""}${c.name}${RST} ${meta}${liveTag}`;
-
-								lines.push(cur ? `  ${YEL}▶${RST} ${label}` : `    ${label}`);
+						try {
+							await api("/api/combos", {
+								method: "POST",
+								body: JSON.stringify({ name, strategy, models: selected }),
 							});
+							ctx.ui.notify(`✅ Created combo "${name}" with ${selected.length} models`, "info");
+						} catch (e: any) {
+							ctx.ui.notify(`Failed: ${e.message}`, "error");
+						}
+						continue;
+					}
 
-							// Done row
-							const doneCur = sel === combos.length;
-							lines.push(doneCur ? `  ${YEL}▶${RST} ${DIM}── Done ──${RST}` : `    ${DIM}── Done ──${RST}`);
+					// Selected an existing combo
+					const idx = options.indexOf(pick);
+					if (idx < 0 || idx >= combos.length) continue;
+					const combo = combos[idx];
 
-							lines.push("");
-							if (busy) lines.push(`  ${DIM}working…${RST}`);
+					const action = await ctx.ui.select(
+						`${combo.name} [${combo.strategy}]:`,
+						[
+							combo.isActive !== false ? "⬜ Disable" : "✅ Enable",
+							"🔴 Set as active model",
+							"✏️ Edit models",
+							"📋 Edit strategy",
+							"🗑️ Delete combo",
+							"← Back",
+						]
+					);
+					if (!action || action === "← Back") continue;
 
-							return lines;
-						},
-
-						handleInput(data: string) {
-							if (busy) return;
-
-							const total = combos.length + 1; // +1 for Done row
-
-							// Navigation
-							if (data === "\x1b[A" || data === "\x1b[OA") { // up
-								sel = (sel - 1 + total) % total;
-								tui.requestRender(true);
-								return;
+					if (action.includes("Disable") || action.includes("Enable")) {
+						const newState = combo.isActive === false;
+						try {
+							await api(`/api/combos/${combo.id}`, {
+								method: "PUT",
+								body: JSON.stringify({ isActive: newState }),
+							});
+							ctx.ui.notify(`${combo.name} ${newState ? "enabled" : "disabled"}`, "info");
+						} catch (e: any) {
+							ctx.ui.notify(`Failed: ${e.message}`, "error");
+						}
+					} else if (action.includes("Set as active")) {
+						const model = ctx.modelRegistry.getAll().find((m) => m.id === combo.name);
+						if (!model) {
+							ctx.ui.notify(`"${combo.name}" not in model list — run /omni sync first`, "warning");
+						} else {
+							await pi.setModel(model);
+							ctx.ui.setStatus("omni", `🔴 ${combo.name}`);
+							ctx.ui.notify(`Active model → ${combo.name}`, "info");
+						}
+					} else if (action.includes("Edit models")) {
+						ctx.ui.notify("Syncing models from OmniRoute…", "info");
+						const allModels = await getAllModelsFromOmniRoute();
+						const currentModels = combo.models.map((m) => typeof m === "string" ? m : m.model);
+						const selected = await pickModelsLoop(ctx, allModels, currentModels);
+						if (!selected || selected.length === 0) continue;
+						try {
+							await api(`/api/combos/${combo.id}`, {
+								method: "PUT",
+								body: JSON.stringify({ models: selected }),
+							});
+							ctx.ui.notify(`✅ Updated "${combo.name}" — ${selected.length} models`, "info");
+						} catch (e: any) {
+							ctx.ui.notify(`Failed: ${e.message}`, "error");
+						}
+					} else if (action.includes("Edit strategy")) {
+						const strategy = await ctx.ui.select("Strategy:", ["priority", "round-robin", "random", "least-latency"]);
+						if (!strategy) continue;
+						try {
+							await api(`/api/combos/${combo.id}`, {
+								method: "PUT",
+								body: JSON.stringify({ strategy }),
+							});
+							ctx.ui.notify(`✅ "${combo.name}" strategy → ${strategy}`, "info");
+						} catch (e: any) {
+							ctx.ui.notify(`Failed: ${e.message}`, "error");
+						}
+					} else if (action.includes("Delete")) {
+						const confirm = await ctx.ui.select(`Delete "${combo.name}"? This cannot be undone.`, ["Yes — delete", "No — cancel"]);
+						if (confirm?.startsWith("Yes")) {
+							try {
+								await api(`/api/combos/${combo.id}`, { method: "DELETE" });
+								ctx.ui.notify(`Deleted "${combo.name}"`, "info");
+							} catch (e: any) {
+								ctx.ui.notify(`Failed: ${e.message}`, "error");
 							}
-							if (data === "\x1b[B" || data === "\x1b[OB") { // down
-								sel = (sel + 1) % total;
-								tui.requestRender(true);
-								return;
-							}
-
-							// Escape / q → close
-							if (data === "\x1b" || data === "q") {
-								done(null);
-								return;
-							}
-
-							// Done row selected
-							if (sel === combos.length) {
-								if (data === "\r" || data === "\n" || data === " ") done(null);
-								return;
-							}
-
-							const combo = combos[sel];
-							if (!combo) return;
-
-							// Space → toggle ON/OFF
-							if (data === " ") {
-								busy = true;
-								tui.requestRender(true);
-								const newState = combo.isActive === false;
-								api(`/api/combos/${combo.id}`, {
-									method: "PUT",
-									body: JSON.stringify({ isActive: newState }),
-								}).then(() => {
-									statusLine = `${newState ? GRN + "✅" : GRY + "⬜"}${RST} ${combo.name} ${newState ? "ON" : "OFF"}  ${GRY}· Space toggle · Enter set active · Esc done${RST}`;
-									busy = false;
-									refresh();
-								}).catch((e: any) => {
-									statusLine = `${RED}Error:${RST} ${e.message}`;
-									busy = false;
-									tui.requestRender(true);
-								});
-								return;
-							}
-
-							// Enter → set as active model
-							if (data === "\r" || data === "\n") {
-								const model = ctx.modelRegistry.getAll().find((m) => m.id === combo.name);
-								if (!model) {
-									statusLine = `${YEL}⚠${RST} "${combo.name}" not in model list — run /omni sync first`;
-									tui.requestRender(true);
-									return;
-								}
-								busy = true;
-								tui.requestRender(true);
-								(pi.setModel(model) as Promise<boolean>).then((ok) => {
-									if (ok) {
-										statusLine = `${RED}🔴${RST} Active model → ${B}${combo.name}${RST}  ${GRY}· Space toggle · Enter set active · Esc done${RST}`;
-										ctx.ui.setStatus("omni", `🔴 ${combo.name}`);
-									} else {
-										statusLine = `${RED}Error:${RST} no API key for omni provider`;
-									}
-									busy = false;
-									tui.requestRender(true);
-								});
-								return;
-							}
-						},
-					};
-				});
-
-				// Summary notification after closing
-				const final = await listCombos();
-				const liveNow = ctx.model?.id ?? "";
-				ctx.ui.notify(
-					`Combos:\n${final.map((c, i) => comboLine(c, i) + (c.name === liveNow ? " 🔴 active" : "")).join("\n")}`,
-					"info"
-				);
+						}
+					}
+				}
 				return;
 			}
 
@@ -1506,7 +1524,7 @@ export default function (pi: ExtensionAPI) {
 			// ──────────────── Unknown ────────────────
 
 			ctx.ui.notify(
-				`Unknown: /omni ${sub}\n\nAvailable: toggle, providers, add-provider, sync, log-review, doctor, setup-key, dashboard`,
+				`Unknown: /omni ${sub}\n\nAvailable: combos, providers, add-provider, sync, log-review, doctor, setup-key, dashboard`,
 				"warning"
 			);
 		},
