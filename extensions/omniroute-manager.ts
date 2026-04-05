@@ -273,15 +273,106 @@ function findConnPrefixedCombos(combos: Combo[], connections: Connection[]): Doc
 	return issues;
 }
 
-/** Find antigravity accounts missing projectId */
+/** Find antigravity accounts missing projectId and offer to deprioritize */
 function findMissingProjectIds(connections: Connection[]): DoctorIssue[] {
-	return connections
-		.filter((c) => c.provider === "antigravity" && c.isActive && !c.projectId)
-		.map((c) => ({
-			severity: "warning" as const,
-			message: `Antigravity account "${c.name}" is missing projectId — Google will reject requests with 400. ` +
-				`Reconnect this account in the dashboard: ${DASHBOARD_URL} → Providers → disconnect & reconnect.`,
-		}));
+	const broken = connections.filter((c) => c.provider === "antigravity" && c.isActive && !c.projectId);
+	const healthy = connections.filter((c) => c.provider === "antigravity" && c.isActive && c.projectId);
+
+	return broken.map((c) => ({
+		severity: "warning" as const,
+		message: `Antigravity account "${c.name}" is missing projectId — Google will reject requests with 400. ` +
+			(healthy.length > 0
+				? `${healthy.length} other antigravity account(s) are healthy. `
+				: `Consider using Gemini AI Studio (API key) instead — it doesn't need a projectId. `) +
+			`Reconnect in dashboard, or deprioritize this account.`,
+		fix: async () => {
+			// Set priority to 99 so healthy accounts are tried first
+			await api(`/api/providers/${c.id}`, {
+				method: "PATCH",
+				body: JSON.stringify({ priority: 99 }),
+			});
+			return `✅ Deprioritized "${c.name}" (priority → 99). Healthy accounts will be used first.`;
+		},
+	}));
+}
+
+/** Find combos where all models depend on a single provider that has issues */
+function findFragileCombos(combos: Combo[], connections: Connection[]): DoctorIssue[] {
+	const issues: DoctorIssue[] = [];
+
+	// Check which providers have healthy accounts
+	const healthyProviders = new Set<string>();
+	for (const c of connections) {
+		if (c.isActive && c.testStatus === "active") {
+			// For antigravity, only count if it has projectId
+			if (c.provider === "antigravity" && !c.projectId) continue;
+			healthyProviders.add(c.provider);
+		}
+	}
+
+	// Check if gemini (AI Studio) is available as an alternative
+	const hasGemini = healthyProviders.has("gemini");
+
+	for (const combo of combos) {
+		if (combo.isActive === false) continue;
+		const models = combo.models.map((m) => (typeof m === "string" ? m : m.model));
+		const providers = models.map((m) => m.split("/")[0]);
+		const uniqueProviders = providers.filter((p, i) => providers.indexOf(p) === i);
+
+		// All models use antigravity and it's broken
+		const allAntigravity = uniqueProviders.length === 1 && uniqueProviders[0] === "antigravity";
+		if (allAntigravity && !healthyProviders.has("antigravity") && hasGemini) {
+			issues.push({
+				severity: "error",
+				message: `Combo "${combo.name}" uses only antigravity models (which have projectId issues). ` +
+					`Gemini AI Studio is available and working — swap to gemini/ models?`,
+				fix: async () => {
+					// Map antigravity model names to gemini equivalents
+					const mapped = models.map((m) => {
+						const modelName = m.split("/").slice(1).join("/");
+						return `gemini/${modelName}`;
+					});
+					// Verify the gemini models exist
+					let available: string[] = [];
+					try {
+						const data = await api("/v1/models");
+						available = (data?.data || []).map((m: any) => m.id).filter(Boolean);
+					} catch {}
+					const valid = mapped.filter((m) => available.includes(m));
+					if (valid.length === 0) {
+						// Fall back to popular gemini models
+						valid.push("gemini/gemini-2.5-pro");
+						if (combo.strategy === "round-robin") valid.push("gemini/gemini-2.5-flash");
+					}
+					await api(`/api/combos/${combo.id}`, {
+						method: "PUT",
+						body: JSON.stringify({ models: valid }),
+					});
+					return `✅ Fixed "${combo.name}": switched to ${valid.join(", ")}`;
+				},
+			});
+		}
+
+		// Combo has models from providers with zero healthy accounts
+		const deadProviders = uniqueProviders.filter((p) => !healthyProviders.has(p));
+		if (deadProviders.length > 0 && !allAntigravity) {
+			const aliveModels = models.filter((m) => !deadProviders.includes(m.split("/")[0]));
+			if (aliveModels.length === 0) {
+				issues.push({
+					severity: "warning",
+					message: `Combo "${combo.name}" has no models from healthy providers ` +
+						`(broken: ${deadProviders.join(", ")}). All requests will fail.`,
+				});
+			} else if (deadProviders.length > 0) {
+				issues.push({
+					severity: "info",
+					message: `Combo "${combo.name}" includes models from unhealthy providers ` +
+						`(${deadProviders.join(", ")}). These will be skipped at runtime.`,
+				});
+			}
+		}
+	}
+	return issues;
 }
 
 /** Check if the pi models.json API key looks invalid */
@@ -302,18 +393,36 @@ function checkApiKey(): DoctorIssue[] {
 	return [];
 }
 
+/** Find combos with no models */
+function findEmptyCombos(combos: Combo[]): DoctorIssue[] {
+	return combos
+		.filter((c) => c.models.length === 0)
+		.map((c) => ({
+			severity: "error" as const,
+			message: `Combo "${c.name}" has no models. It will fail if selected. ` +
+				`Add models in the dashboard: ${DASHBOARD_URL}`,
+		}));
+}
+
 /** Check for accounts with expired or soon-to-expire tokens */
 function findExpiringAccounts(connections: Connection[]): DoctorIssue[] {
 	const issues: DoctorIssue[] = [];
 	const now = Date.now();
 	for (const c of connections) {
-		if (!c.isActive || c.authType !== "oauth") continue;
-		if (c.expiresAt) {
-			const exp = new Date(c.expiresAt).getTime();
+		if (!c.isActive) continue;
+		
+		const expiry = c.expiresAt || c.tokenExpiresAt;
+		if (expiry) {
+			const exp = new Date(expiry).getTime();
 			if (exp < now) {
 				issues.push({
 					severity: "warning",
-					message: `Account "${c.name}" (${c.provider}) OAuth session expired. Reconnect in dashboard.`,
+					message: `Account "${c.name}" (${c.provider}) session expired. Reconnect in dashboard.`,
+				});
+			} else if (exp < now + 1000 * 60 * 60 * 24) { // expires within 24h
+				issues.push({
+					severity: "info",
+					message: `Account "${c.name}" (${c.provider}) session expires soon (within 24h).`,
 				});
 			}
 		}
@@ -502,6 +611,7 @@ export default function (pi: ExtensionAPI) {
 			const issues = [
 				...checkApiKey(),
 				...findConnPrefixedCombos(combos, conns),
+				...findFragileCombos(combos, conns),
 				...findMissingProjectIds(conns),
 				...findExpiringAccounts(conns),
 			];
@@ -1178,6 +1288,7 @@ export default function (pi: ExtensionAPI) {
 				const issues = [
 					...checkApiKey(),
 					...findConnPrefixedCombos(combos, conns),
+					...findFragileCombos(combos, conns),
 					...findMissingProjectIds(conns),
 					...findExpiringAccounts(conns),
 				];
