@@ -4,14 +4,14 @@ A [Pi Coding Agent](https://github.com/badlogic/pi-mono/tree/main/packages/codin
 
 ## What it does
 
-- **Status bar** shows which model actually served each response — e.g. `CheapFix → gemini-2.5-flash-lite (gemini · Google Account)`
+- **Auto-start** — automatically launches OmniRoute when pi starts if the server isn't running
+- **Status bar** shows which model actually served each response — e.g. `CheapFix → gemini-2.5-flash (gemini · Google Account)`
 - **Combo preview** on model switch — immediately shows the routing order before you send a message
 - **Startup warnings** if any provider connections are expired or need re-authentication
-- **Combo management** — toggle on/off and switch active model without leaving pi
+- **Combo management** — edit models, create, and delete combos from within pi
 - **Provider browser** — drill into providers to see accounts, connection health, and available models
 - **Model sync** — push all OmniRoute models and combos to pi's Ctrl+P model picker
-- **Log review** — analyse call history to find broken models, with replacement suggestions
-- **Add custom providers** — register OpenAI-compatible providers not built into OmniRoute
+- **Health diagnostics** — call log analysis, config diagnostics, and auto-fix
 
 ## Install
 
@@ -19,16 +19,16 @@ A [Pi Coding Agent](https://github.com/badlogic/pi-mono/tree/main/packages/codin
 
 ```bash
 mkdir -p ~/.pi/agent/extensions
-curl -o ~/.pi/agent/extensions/omniroute-manager.ts \
-  https://raw.githubusercontent.com/oscar-haha/omniroute-pi-extension/main/omniroute-manager.ts
+curl -o ~/.pi/agent/extensions/omniroute.ts \
+  https://raw.githubusercontent.com/oscar-haha/omniroute-pi-extension/main/extensions/omniroute-manager.ts
 ```
 
 ### Option 2 — npm
 
 ```bash
 npm install -g omniroute-pi-extension
-cp "$(npm root -g)/omniroute-pi-extension/omniroute-manager.ts" \
-  ~/.pi/agent/extensions/omniroute-manager.ts
+cp "$(npm root -g)/omniroute-pi-extension/extensions/omniroute-manager.ts" \
+  ~/.pi/agent/extensions/omniroute.ts
 ```
 
 ### Configure pi to use OmniRoute as a provider
@@ -43,7 +43,7 @@ Add an `omni` provider to `~/.pi/agent/models.json`:
       "api": "anthropic-messages",
       "apiKey": "YOUR_OMNIROUTE_API_KEY",
       "models": [
-        { "id": "CheapFix", "name": "CheapFix" }
+        { "id": "RoundRobin", "name": "RoundRobin" }
       ]
     }
   }
@@ -60,67 +60,40 @@ Then run `/omni sync` inside pi to populate the full model list automatically.
 pi
 ```
 
-The extension auto-loads. You'll see `OmniRoute ready — N combos` on startup.
+The extension auto-loads. If OmniRoute isn't running, the extension will start it automatically. You'll see `OmniRoute ready — N combos` on startup.
 
 ## Commands
 
 | Command | Description |
 |---------|-------------|
 | `/omni` | Status dashboard — health, active combos, provider issues |
-| `/omni toggle` | Interactive combo manager — Space toggles ON/OFF, Enter sets active model, Esc exits |
-| `/omni providers` | Browse providers — select one to see accounts and available models |
-| `/omni add-provider` | Register an OpenAI-compatible provider not built into OmniRoute |
+| `/omni combos` | Manage combos — edit models, create, delete |
+| `/omni providers` | Browse providers, models & add new ones |
+| `/omni health` | Call log analysis + config diagnostics & auto-fix |
 | `/omni sync` | Sync all OmniRoute models and combos to pi's Ctrl+P picker |
-| `/omni log-review` | Analyse call history — flags broken models and suggests replacements |
+| `/omni setup-key` | Create an OmniRoute API key and save it to models.json |
 | `/omni dashboard` | Show OmniRoute web dashboard URL |
-
-### `/omni toggle` keyboard controls
-
-```
-↑ / ↓    Navigate combos
-Space    Toggle combo ON / OFF
-Enter    Set combo as active model immediately
-Esc / q  Close
-```
-
-The status bar updates to show the combo's routing order as soon as you switch, and then updates again after each response to show which model actually ran.
-
-### `/omni log-review`
-
-Fetches the last 200 call logs and analyses each model in each combo:
-
-```
-─── OpenSource [priority] ───
-  ✅ groq/llama-3.3-70b-versatile     100% success · avg 380ms
-  ⚠️  groq/llama-3.3-70b-versatile    context too large for free tier (8× 413) — works in shorter sessions
-  ❌ openrouter/auto                  0/5 success · 403×1, 502×4 → suggest replace
-  ⏱  nvidia/deepseek-ai/deepseek-v3.2 100% success · avg 49s (slow)
-  ❓ nvidia/moonshotai/kimi-k2.5      (no history)
-```
-
-For each broken model (❌) it then prompts you to remove it or pick a replacement from the same provider or others — filtered to exclude models already in the combo.
 
 ## How it works
 
-Pi sends requests to OmniRoute, which routes them to the best available provider based on your combo strategy (priority, weighted, round-robin, least-used). After each response, the extension polls OmniRoute's call logs until it finds the entry for that turn, then displays the actual model and account in pi's status bar.
+Pi sends requests to OmniRoute, which routes them to the best available provider based on your combo strategy (priority, weighted, round-robin, least-used, etc.). After each response, the extension polls OmniRoute's call logs until it finds the entry for that turn, then displays the actual model and account in pi's status bar.
+
+### Auto-start
+
+On session start, the extension checks if OmniRoute is healthy. If not:
+- If OmniRoute is installed, it spawns it as a background process and waits up to 15s for it to come up
+- If OmniRoute is not installed, it shows install instructions (`npm install -g omniroute`)
 
 ### Combos
 
 Combos are model groups with routing strategies. For example:
 
 ```
-CheapFix [priority]:
-  1. qw/qwen3-coder-flash       ← try first (free, fast)
-  2. gemini/gemini-2.5-flash-lite
-  3. groq/qwen/qwen3-32b
-  4. kr/claude-sonnet-4.5       ← last resort fallback
+RoundRobin [round-robin]:
+  gemini-2.5-flash › gpt-5.4 › claude-sonnet-4.5 › gemini-3-flash
 ```
 
-Create and edit combos in the OmniRoute dashboard. Toggle them on/off or switch active model from pi with `/omni toggle`.
-
-### Custom providers
-
-OmniRoute supports 44+ built-in providers. For others (like [OpenAdapter](https://openadapter.in)), use `/omni add-provider` to register any OpenAI-compatible endpoint.
+Create and edit combos in the OmniRoute dashboard or with `/omni combos`.
 
 ## Configuration
 
