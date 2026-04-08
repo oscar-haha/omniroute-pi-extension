@@ -793,9 +793,9 @@ export default function (pi: ExtensionAPI) {
 	// ── /omni command ──
 
 	pi.registerCommand("omni", {
-		description: "OmniRoute: /omni [combos|providers|health|sync|setup-key|dashboard]",
+		description: "OmniRoute: /omni [combos|providers|health|limits|sync|setup-key|dashboard]",
 		getArgumentCompletions(prefix: string) {
-			return ["combos", "providers", "health", "sync", "setup-key", "dashboard"]
+			return ["combos", "providers", "health", "limits", "sync", "setup-key", "dashboard"]
 				.filter((s) => s.startsWith(prefix))
 				.map((s) => ({ value: s, label: s }));
 		},
@@ -1609,10 +1609,79 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
+			// ──────────────── /omni limits ────────────────
+
+			if (sub === "limits" || sub === "quota" || sub === "usage") {
+				try {
+					const [limitsData, conns] = await Promise.all([
+						api("/api/usage/provider-limits"),
+						listConnections(),
+					]);
+
+					const connMap: Record<string, string> = {};
+					for (const c of conns) {
+						const psd = c.providerSpecificData || {};
+						connMap[c.id] = `${psd.nodeName || c.provider}/${c.name}`;
+					}
+
+					const caches = limitsData?.caches || {};
+					const lines: string[] = ["═══ OmniRoute Usage Limits ═══", ""];
+
+					const entries = Object.entries(caches).sort(([a], [b]) =>
+						(connMap[a] || a).localeCompare(connMap[b] || b)
+					);
+
+					for (const [connId, cache] of entries) {
+						const name = connMap[connId] || `unknown (${connId.slice(0, 8)})`;
+						const quotas = (cache as any)?.quotas || {};
+						const models = Object.entries(quotas).sort(([a], [b]) => a.localeCompare(b));
+						if (!models.length) continue;
+
+						// Check if any model has meaningful usage
+						const hasUsage = models.some(([, q]: any) => (q as any).used > 0 || (q as any).total !== 1000);
+
+						lines.push(`─── ${name} ───`);
+						for (const [model, q] of models) {
+							const { used = 0, total = 0, unlimited = false, resetAt } = q as any;
+							const remaining = total - used;
+							const pct = total > 0 ? Math.round((remaining / total) * 100) : 100;
+							const resetDate = resetAt ? resetAt.slice(0, 10) : "?";
+
+							let bar = "";
+							if (!unlimited) {
+								const filled = Math.round((used / total) * 20);
+								bar = "█".repeat(filled) + "░".repeat(20 - filled);
+							}
+
+							if (unlimited) {
+								lines.push(`  ${model}: ${used} used (unlimited)`);
+							} else if (remaining === 0) {
+								lines.push(`  ❌ ${model}: ${used}/${total} (EXHAUSTED) resets ${resetDate}`);
+							} else if (pct <= 20) {
+								lines.push(`  ⚠️  ${model}: ${used}/${total} [${bar}] ${remaining} left — resets ${resetDate}`);
+							} else {
+								lines.push(`  ${model}: ${used}/${total} [${bar}] ${remaining} left — resets ${resetDate}`);
+							}
+						}
+						lines.push("");
+					}
+
+					if (entries.length === 0) {
+						lines.push("No provider limit data available yet.");
+						lines.push("Limits are populated after OmniRoute syncs with providers.");
+					}
+
+					ctx.ui.notify(lines.join("\n"), "info");
+				} catch (e: any) {
+					ctx.ui.notify(`Failed to fetch limits: ${e.message}`, "error");
+				}
+				return;
+			}
+
 			// ──────────────── Unknown ────────────────
 
 			ctx.ui.notify(
-				`Unknown: /omni ${sub}\n\nAvailable: combos, providers, health, sync, setup-key, dashboard`,
+				`Unknown: /omni ${sub}\n\nAvailable: combos, providers, health, limits, sync, setup-key, dashboard`,
 				"warning"
 			);
 		},
