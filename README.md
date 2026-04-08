@@ -11,6 +11,7 @@ A [Pi Coding Agent](https://github.com/badlogic/pi-mono/tree/main/packages/codin
 - **Combo management** — edit models, create, and delete combos from within pi
 - **Provider browser** — drill into providers to see accounts, connection health, and available models
 - **Model sync** — push all OmniRoute models and combos to pi's Ctrl+P model picker
+- **Live usage limits** — query provider APIs directly for real-time quota and rate limit data
 - **Health diagnostics** — call log analysis, config diagnostics, and auto-fix
 
 ## Install
@@ -70,9 +71,30 @@ The extension auto-loads. If OmniRoute isn't running, the extension will start i
 | `/omni combos` | Manage combos — edit models, create, delete |
 | `/omni providers` | Browse providers, models & add new ones |
 | `/omni health` | Call log analysis + config diagnostics & auto-fix |
+| `/omni limits` | Live usage quotas — queries provider APIs directly |
 | `/omni sync` | Sync all OmniRoute models and combos to pi's Ctrl+P picker |
 | `/omni setup-key` | Create an OmniRoute API key and save it to models.json |
 | `/omni dashboard` | Show OmniRoute web dashboard URL |
+
+### `/omni limits`
+
+Fetches live quota data directly from each provider's API (bypasses OmniRoute's cache):
+
+```
+─── antigravity/oscar@yulife (Free) ───
+  gemini-3-pro-high: [████████░░░░░░░░░░░░] 60% left — resets 2026-04-12 09:55
+  gemini-3-pro-low: [████████░░░░░░░░░░░░] 60% left — resets 2026-04-12 09:55
+  + 13 more model(s) at 100%
+
+─── codex/oscarharry@gmail.com (free) ───
+  ❌ session: EXHAUSTED — resets 2026-04-12 08:39
+  code_review: [░░░░░░░░░░░░░░░░░░░░] 100% left — resets 2026-04-15
+
+─── kiro/OH@gm kiro (KIRO FREE) ───
+  credit (0/50): [░░░░░░░░░░░░░░░░░░░░] 100% left — resets 2026-04-28
+```
+
+Supported providers: Antigravity (Google), Codex (OpenAI), Kiro (AWS), Kimi Coding. Gemini API-key accounts and Alibaba don't expose usage APIs.
 
 ## How it works
 
