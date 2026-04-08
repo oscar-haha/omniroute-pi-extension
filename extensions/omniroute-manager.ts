@@ -42,7 +42,7 @@
  */
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { spawn as nodeSpawn } from "child_process";
+import { spawn as nodeSpawn, execSync } from "child_process";
 import { existsSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
@@ -83,6 +83,266 @@ async function waitForHealthy(timeoutMs = 15_000, intervalMs = 1_000): Promise<b
 		await new Promise((r) => setTimeout(r, intervalMs));
 	}
 	return false;
+}
+
+// ────────────────────────── direct quota fetching ──────────────────────────
+
+const OMNIROUTE_DB = join(homedir(), ".omniroute", "storage.sqlite");
+
+interface DirectQuota {
+	name: string;
+	used: number;
+	total: number;
+	resetAt: string | null;
+	unlimited: boolean;
+	exhausted: boolean;
+}
+
+interface AccountQuota {
+	provider: string;
+	account: string;
+	plan: string | null;
+	quotas: DirectQuota[];
+	error: string | null;
+}
+
+function dbQuery(sql: string): string {
+	try {
+		return execSync(`sqlite3 "${OMNIROUTE_DB}" "${sql}"`, { encoding: "utf8", timeout: 5000 }).trim();
+	} catch { return ""; }
+}
+
+function getConnectionTokens(): Array<{
+	provider: string; name: string; accessToken: string;
+	psd: Record<string, any>;
+}> {
+	const rows = dbQuery(
+		"SELECT provider, name, access_token, provider_specific_data FROM provider_connections WHERE is_active = 1"
+	);
+	if (!rows) return [];
+	return rows.split("\n").map((row) => {
+		const [provider, name, token, psdRaw] = row.split("|");
+		let psd = {};
+		try { psd = JSON.parse(psdRaw || "{}"); } catch {}
+		return { provider, name, accessToken: token || "", psd };
+	});
+}
+
+async function fetchAntigravityQuota(token: string): Promise<AccountQuota["quotas"]> {
+	// Get project ID
+	let projectId = "";
+	try {
+		const projRes = await fetch("https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist", {
+			method: "POST",
+			headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", "User-Agent": "antigravity/1.11.3 Darwin/arm64" },
+			body: JSON.stringify({ metadata: { ideType: "IDE_UNSPECIFIED", platform: "PLATFORM_UNSPECIFIED", pluginType: "GEMINI" } }),
+			signal: AbortSignal.timeout(10000),
+		});
+		if (projRes.ok) {
+			const d = await projRes.json();
+			projectId = d.cloudaicompanionProject || "";
+		}
+	} catch {}
+
+	const res = await fetch("https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels", {
+		method: "POST",
+		headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", "User-Agent": "antigravity/1.11.3 Darwin/arm64" },
+		body: JSON.stringify(projectId ? { project: projectId } : {}),
+		signal: AbortSignal.timeout(10000),
+	});
+	if (!res.ok) throw new Error(`HTTP ${res.status}`);
+	const data = await res.json();
+	const models = data.models || {};
+	const quotas: DirectQuota[] = [];
+	const excluded = new Set(["chat_20706", "chat_23310", "tab_flash_lite_preview", "tab_jump_flash_lite_preview"]);
+
+	for (const [name, info] of Object.entries(models) as any[]) {
+		if (info.isInternal || excluded.has(name)) continue;
+		const qi = info.quotaInfo || {};
+		const frac = typeof qi.remainingFraction === "number" ? qi.remainingFraction : 1;
+		const isUnlimited = !qi.resetTime && frac >= 1;
+		const pct = Math.round(frac * 100);
+		quotas.push({
+			name,
+			used: isUnlimited ? 0 : 100 - pct,
+			total: 100,
+			resetAt: qi.resetTime || null,
+			unlimited: isUnlimited,
+			exhausted: !isUnlimited && pct === 0,
+		});
+	}
+	return quotas;
+}
+
+async function fetchCodexQuota(token: string, workspaceId: string): Promise<AccountQuota["quotas"]> {
+	const headers: Record<string, string> = {
+		Authorization: `Bearer ${token}`,
+		Accept: "application/json",
+	};
+	if (workspaceId) headers["chatgpt-account-id"] = workspaceId;
+
+	const res = await fetch("https://chatgpt.com/backend-api/wham/usage", {
+		headers,
+		signal: AbortSignal.timeout(10000),
+	});
+	if (!res.ok) throw new Error(`HTTP ${res.status}`);
+	const data = await res.json();
+	const quotas: DirectQuota[] = [];
+	const rl = data.rate_limit || {};
+
+	if (rl.primary_window) {
+		const w = rl.primary_window;
+		const resetAt = w.reset_at ? new Date(w.reset_at * 1000).toISOString() : null;
+		quotas.push({
+			name: "session",
+			used: w.used_percent || 0,
+			total: 100,
+			resetAt,
+			unlimited: false,
+			exhausted: rl.limit_reached === true,
+		});
+	}
+	if (rl.secondary_window) {
+		const w = rl.secondary_window;
+		const resetAt = w.reset_at ? new Date(w.reset_at * 1000).toISOString() : null;
+		quotas.push({
+			name: "weekly",
+			used: w.used_percent || 0,
+			total: 100,
+			resetAt,
+			unlimited: false,
+			exhausted: w.used_percent >= 100,
+		});
+	}
+	const cr = data.code_review_rate_limit;
+	if (cr?.primary_window) {
+		const w = cr.primary_window;
+		const resetAt = w.reset_at ? new Date(w.reset_at * 1000).toISOString() : null;
+		quotas.push({
+			name: "code_review",
+			used: w.used_percent || 0,
+			total: 100,
+			resetAt,
+			unlimited: false,
+			exhausted: cr.limit_reached === true,
+		});
+	}
+	return quotas;
+}
+
+async function fetchKiroQuota(token: string): Promise<{ plan: string | null; quotas: DirectQuota[] }> {
+	const res = await fetch("https://codewhisperer.us-east-1.amazonaws.com", {
+		method: "POST",
+		headers: {
+			Authorization: `Bearer ${token}`,
+			"Content-Type": "application/x-amz-json-1.0",
+			"x-amz-target": "AmazonCodeWhispererService.GetUsageLimits",
+		},
+		body: JSON.stringify({ origin: "AI_EDITOR", resourceType: "AGENTIC_REQUEST" }),
+		signal: AbortSignal.timeout(10000),
+	});
+	if (!res.ok) throw new Error(`HTTP ${res.status}`);
+	const data = await res.json();
+	const quotas: DirectQuota[] = [];
+	const resetEpoch = data.nextDateReset;
+	const resetAt = resetEpoch ? new Date(resetEpoch * 1000).toISOString() : null;
+
+	for (const b of data.usageBreakdownList || []) {
+		const used = b.currentUsageWithPrecision || 0;
+		const total = b.usageLimitWithPrecision || 0;
+		const name = (b.resourceType || "unknown").toLowerCase();
+		quotas.push({
+			name: `${name} (${used}/${total})`,
+			used: total > 0 ? Math.round((used / total) * 100) : 0,
+			total: 100,
+			resetAt,
+			unlimited: total === 0,
+			exhausted: total > 0 && used >= total,
+		});
+	}
+	return { plan: data.subscriptionInfo?.subscriptionTitle || null, quotas };
+}
+
+async function fetchKimiQuota(token: string): Promise<AccountQuota["quotas"]> {
+	const res = await fetch("https://api.kimi.com/coding/v1/usages", {
+		headers: {
+			Authorization: `Bearer ${token}`,
+			"Content-Type": "application/json",
+			"X-Msh-Platform": "omniroute",
+		},
+		signal: AbortSignal.timeout(10000),
+	});
+	if (!res.ok) throw new Error(`HTTP ${res.status}`);
+	const data = await res.json();
+	if (data.code) throw new Error(data.details?.[0]?.debug?.localizedMessage?.message || data.code);
+	const quotas: DirectQuota[] = [];
+	const usage = data.usage || {};
+	const limit = parseInt(usage.limit || "0", 10);
+	const used = parseInt(usage.used || "0", 10);
+	if (limit > 0) {
+		quotas.push({
+			name: "weekly",
+			used, total: limit,
+			resetAt: usage.resetTime || null,
+			unlimited: false,
+			exhausted: used >= limit,
+		});
+	}
+	return quotas;
+}
+
+async function fetchAllQuotasDirect(): Promise<AccountQuota[]> {
+	const conns = getConnectionTokens();
+	const results: AccountQuota[] = [];
+
+	const tasks = conns.map(async (conn) => {
+		const entry: AccountQuota = {
+			provider: conn.provider,
+			account: conn.name,
+			plan: null,
+			quotas: [],
+			error: null,
+		};
+
+		if (!conn.accessToken) {
+			entry.error = "No access token (API key provider — no quota API)";
+			return entry;
+		}
+
+		try {
+			switch (conn.provider) {
+				case "antigravity":
+					entry.quotas = await fetchAntigravityQuota(conn.accessToken);
+					break;
+				case "codex":
+					entry.quotas = await fetchCodexQuota(conn.accessToken, conn.psd.workspaceId || "");
+					entry.plan = conn.psd.workspacePlanType || null;
+					break;
+				case "kimi-coding":
+					entry.quotas = await fetchKimiQuota(conn.accessToken);
+					break;
+				case "kiro": {
+					const kiro = await fetchKiroQuota(conn.accessToken);
+					entry.quotas = kiro.quotas;
+					entry.plan = kiro.plan;
+					break;
+				}
+				default:
+					entry.error = "No quota API available";
+					break;
+			}
+		} catch (e: any) {
+			entry.error = e.message || "Failed";
+		}
+		return entry;
+	});
+
+	const settled = await Promise.allSettled(tasks);
+	for (const r of settled) {
+		if (r.status === "fulfilled") results.push(r.value);
+	}
+
+	return results.sort((a, b) => `${a.provider}/${a.account}`.localeCompare(`${b.provider}/${b.account}`));
 }
 
 // ────────────────────────── helpers ──────────────────────────
@@ -1613,67 +1873,65 @@ export default function (pi: ExtensionAPI) {
 
 			if (sub === "limits" || sub === "quota" || sub === "usage") {
 				try {
-					const [limitsData, conns] = await Promise.all([
-						api("/api/usage/provider-limits"),
-						listConnections(),
-					]);
+					ctx.ui.setStatus("omni", "Fetching live quotas…");
+					const accounts = await fetchAllQuotasDirect();
+					const lines: string[] = ["═══ OmniRoute Usage Limits (live) ═══", ""];
 
-					const connMap: Record<string, string> = {};
-					for (const c of conns) {
-						const psd = c.providerSpecificData || {};
-						connMap[c.id] = `${psd.nodeName || c.provider}/${c.name}`;
-					}
+					for (const acct of accounts) {
+						const label = `${acct.provider}/${acct.account}${acct.plan ? ` (${acct.plan})` : ""}`;
+						lines.push(`─── ${label} ───`);
 
-					const caches = limitsData?.caches || {};
-					const lines: string[] = ["═══ OmniRoute Usage Limits ═══", ""];
+						if (acct.error) {
+							lines.push(`  ${acct.error}`);
+						} else if (!acct.quotas.length) {
+							lines.push("  No quota data returned");
+						} else {
+							const sorted = acct.quotas.sort((a, b) => a.name.localeCompare(b.name));
+							const active = sorted.filter((q) => q.used > 0 || q.exhausted);
+							const unused = sorted.filter((q) => q.used === 0 && !q.exhausted && !q.unlimited);
 
-					const entries = Object.entries(caches).sort(([a], [b]) =>
-						(connMap[a] || a).localeCompare(connMap[b] || b)
-					);
+							// Show models with usage first
+							for (const q of active) {
+								const remaining = q.total - q.used;
+								const pct = q.total > 0 ? Math.round((remaining / q.total) * 100) : 100;
+								const resetDate = q.resetAt ? q.resetAt.slice(0, 16).replace("T", " ") : "?";
 
-					for (const [connId, cache] of entries) {
-						const name = connMap[connId] || `unknown (${connId.slice(0, 8)})`;
-						const quotas = (cache as any)?.quotas || {};
-						const models = Object.entries(quotas).sort(([a], [b]) => a.localeCompare(b));
-						if (!models.length) continue;
+								const filled = q.total > 0 ? Math.round((q.used / q.total) * 20) : 0;
+								const bar = "█".repeat(filled) + "░".repeat(20 - filled);
 
-						// Check if any model has meaningful usage
-						const hasUsage = models.some(([, q]: any) => (q as any).used > 0 || (q as any).total !== 1000);
-
-						lines.push(`─── ${name} ───`);
-						for (const [model, q] of models) {
-							const { used = 0, total = 0, unlimited = false, resetAt } = q as any;
-							const remaining = total - used;
-							const pct = total > 0 ? Math.round((remaining / total) * 100) : 100;
-							const resetDate = resetAt ? resetAt.slice(0, 10) : "?";
-
-							let bar = "";
-							if (!unlimited) {
-								const filled = Math.round((used / total) * 20);
-								bar = "█".repeat(filled) + "░".repeat(20 - filled);
+								if (q.exhausted || remaining <= 0) {
+									lines.push(`  ❌ ${q.name}: EXHAUSTED — resets ${resetDate}`);
+								} else if (pct <= 20) {
+									lines.push(`  ⚠️  ${q.name}: [${bar}] ${pct}% left — resets ${resetDate}`);
+								} else {
+									lines.push(`  ${q.name}: [${bar}] ${pct}% left — resets ${resetDate}`);
+								}
 							}
 
-							if (unlimited) {
-								lines.push(`  ${model}: ${used} used (unlimited)`);
-							} else if (remaining === 0) {
-								lines.push(`  ❌ ${model}: ${used}/${total} (EXHAUSTED) resets ${resetDate}`);
-							} else if (pct <= 20) {
-								lines.push(`  ⚠️  ${model}: ${used}/${total} [${bar}] ${remaining} left — resets ${resetDate}`);
-							} else {
-								lines.push(`  ${model}: ${used}/${total} [${bar}] ${remaining} left — resets ${resetDate}`);
+							// Show unlimited models
+							const unlimitedModels = sorted.filter((q) => q.unlimited);
+							if (unlimitedModels.length) {
+								lines.push(`  ${unlimitedModels.map((q) => q.name).join(", ")}: unlimited`);
+							}
+
+							// Summarize untouched models
+							if (unused.length > 0 && active.length > 0) {
+								lines.push(`  + ${unused.length} more model(s) at 100%`);
+							} else if (unused.length > 0 && active.length === 0) {
+								// All unused — show a few names
+								const preview = unused.slice(0, 4).map((q) => q.name).join(", ");
+								const more = unused.length > 4 ? ` +${unused.length - 4} more` : "";
+								lines.push(`  All at 100%: ${preview}${more}`);
 							}
 						}
 						lines.push("");
 					}
 
-					if (entries.length === 0) {
-						lines.push("No provider limit data available yet.");
-						lines.push("Limits are populated after OmniRoute syncs with providers.");
-					}
-
 					ctx.ui.notify(lines.join("\n"), "info");
+					ctx.ui.setStatus("omni", "OmniRoute ✓");
 				} catch (e: any) {
 					ctx.ui.notify(`Failed to fetch limits: ${e.message}`, "error");
+					ctx.ui.setStatus("omni", "OmniRoute ✓");
 				}
 				return;
 			}
