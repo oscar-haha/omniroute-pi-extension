@@ -16,20 +16,8 @@ A [Pi Coding Agent](https://github.com/badlogic/pi-mono/tree/main/packages/codin
 
 ## Install
 
-### Option 1 — curl (quickest)
-
 ```bash
-mkdir -p ~/.pi/agent/extensions
-curl -o ~/.pi/agent/extensions/omniroute.ts \
-  https://raw.githubusercontent.com/oscar-haha/omniroute-pi-extension/main/extensions/omniroute-manager.ts
-```
-
-### Option 2 — npm
-
-```bash
-npm install -g omniroute-pi-extension
-cp "$(npm root -g)/omniroute-pi-extension/extensions/omniroute-manager.ts" \
-  ~/.pi/agent/extensions/omniroute.ts
+pi install git:github.com/oscar-haha/omniroute-pi-extension
 ```
 
 ### Configure pi to use OmniRoute as a provider
