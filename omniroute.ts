@@ -42,7 +42,7 @@
  */
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { spawn as nodeSpawn } from "child_process";
+import { spawn as nodeSpawn, execSync } from "child_process";
 import { existsSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
@@ -52,12 +52,25 @@ const DASHBOARD_URL = process.env.OMNIROUTE_DASHBOARD || "http://localhost:20128
 
 // ────────────────────────── auto-start ──────────────────────────
 
+const OMNIROUTE_BIN = join(
+	homedir(),
+	".local", "node", "lib", "node_modules", "omniroute", "bin", "omniroute.mjs"
+);
+
 /**
  * Start OmniRoute as a detached background process.
- * Disabled in Docker container - using host OmniRoute instead.
+ * Returns true if spawned, false if the binary wasn't found.
  */
 function startOmniRoute(): boolean {
-	return false;
+	if (!existsSync(OMNIROUTE_BIN)) return false;
+
+	const child = nodeSpawn(process.execPath, [OMNIROUTE_BIN, "--no-open"], {
+		detached: true,
+		stdio: "ignore",
+		env: { ...process.env },
+	});
+	child.unref();
+	return true;
 }
 
 /**
@@ -70,6 +83,266 @@ async function waitForHealthy(timeoutMs = 15_000, intervalMs = 1_000): Promise<b
 		await new Promise((r) => setTimeout(r, intervalMs));
 	}
 	return false;
+}
+
+// ────────────────────────── direct quota fetching ──────────────────────────
+
+const OMNIROUTE_DB = join(homedir(), ".omniroute", "storage.sqlite");
+
+interface DirectQuota {
+	name: string;
+	used: number;
+	total: number;
+	resetAt: string | null;
+	unlimited: boolean;
+	exhausted: boolean;
+}
+
+interface AccountQuota {
+	provider: string;
+	account: string;
+	plan: string | null;
+	quotas: DirectQuota[];
+	error: string | null;
+}
+
+function dbQuery(sql: string): string {
+	try {
+		return execSync(`sqlite3 "${OMNIROUTE_DB}" "${sql}"`, { encoding: "utf8", timeout: 5000 }).trim();
+	} catch { return ""; }
+}
+
+function getConnectionTokens(): Array<{
+	provider: string; name: string; accessToken: string;
+	psd: Record<string, any>;
+}> {
+	const rows = dbQuery(
+		"SELECT provider, name, access_token, provider_specific_data FROM provider_connections WHERE is_active = 1"
+	);
+	if (!rows) return [];
+	return rows.split("\n").map((row) => {
+		const [provider, name, token, psdRaw] = row.split("|");
+		let psd = {};
+		try { psd = JSON.parse(psdRaw || "{}"); } catch {}
+		return { provider, name, accessToken: token || "", psd };
+	});
+}
+
+async function fetchAntigravityQuota(token: string): Promise<AccountQuota["quotas"]> {
+	// Get project ID
+	let projectId = "";
+	try {
+		const projRes = await fetch("https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist", {
+			method: "POST",
+			headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", "User-Agent": "antigravity/1.11.3 Darwin/arm64" },
+			body: JSON.stringify({ metadata: { ideType: "IDE_UNSPECIFIED", platform: "PLATFORM_UNSPECIFIED", pluginType: "GEMINI" } }),
+			signal: AbortSignal.timeout(10000),
+		});
+		if (projRes.ok) {
+			const d = await projRes.json();
+			projectId = d.cloudaicompanionProject || "";
+		}
+	} catch {}
+
+	const res = await fetch("https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels", {
+		method: "POST",
+		headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", "User-Agent": "antigravity/1.11.3 Darwin/arm64" },
+		body: JSON.stringify(projectId ? { project: projectId } : {}),
+		signal: AbortSignal.timeout(10000),
+	});
+	if (!res.ok) throw new Error(`HTTP ${res.status}`);
+	const data = await res.json();
+	const models = data.models || {};
+	const quotas: DirectQuota[] = [];
+	const excluded = new Set(["chat_20706", "chat_23310", "tab_flash_lite_preview", "tab_jump_flash_lite_preview"]);
+
+	for (const [name, info] of Object.entries(models) as any[]) {
+		if (info.isInternal || excluded.has(name)) continue;
+		const qi = info.quotaInfo || {};
+		const frac = typeof qi.remainingFraction === "number" ? qi.remainingFraction : 1;
+		const isUnlimited = !qi.resetTime && frac >= 1;
+		const pct = Math.round(frac * 100);
+		quotas.push({
+			name,
+			used: isUnlimited ? 0 : 100 - pct,
+			total: 100,
+			resetAt: qi.resetTime || null,
+			unlimited: isUnlimited,
+			exhausted: !isUnlimited && pct === 0,
+		});
+	}
+	return quotas;
+}
+
+async function fetchCodexQuota(token: string, workspaceId: string): Promise<AccountQuota["quotas"]> {
+	const headers: Record<string, string> = {
+		Authorization: `Bearer ${token}`,
+		Accept: "application/json",
+	};
+	if (workspaceId) headers["chatgpt-account-id"] = workspaceId;
+
+	const res = await fetch("https://chatgpt.com/backend-api/wham/usage", {
+		headers,
+		signal: AbortSignal.timeout(10000),
+	});
+	if (!res.ok) throw new Error(`HTTP ${res.status}`);
+	const data = await res.json();
+	const quotas: DirectQuota[] = [];
+	const rl = data.rate_limit || {};
+
+	if (rl.primary_window) {
+		const w = rl.primary_window;
+		const resetAt = w.reset_at ? new Date(w.reset_at * 1000).toISOString() : null;
+		quotas.push({
+			name: "session",
+			used: w.used_percent || 0,
+			total: 100,
+			resetAt,
+			unlimited: false,
+			exhausted: rl.limit_reached === true,
+		});
+	}
+	if (rl.secondary_window) {
+		const w = rl.secondary_window;
+		const resetAt = w.reset_at ? new Date(w.reset_at * 1000).toISOString() : null;
+		quotas.push({
+			name: "weekly",
+			used: w.used_percent || 0,
+			total: 100,
+			resetAt,
+			unlimited: false,
+			exhausted: w.used_percent >= 100,
+		});
+	}
+	const cr = data.code_review_rate_limit;
+	if (cr?.primary_window) {
+		const w = cr.primary_window;
+		const resetAt = w.reset_at ? new Date(w.reset_at * 1000).toISOString() : null;
+		quotas.push({
+			name: "code_review",
+			used: w.used_percent || 0,
+			total: 100,
+			resetAt,
+			unlimited: false,
+			exhausted: cr.limit_reached === true,
+		});
+	}
+	return quotas;
+}
+
+async function fetchKiroQuota(token: string): Promise<{ plan: string | null; quotas: DirectQuota[] }> {
+	const res = await fetch("https://codewhisperer.us-east-1.amazonaws.com", {
+		method: "POST",
+		headers: {
+			Authorization: `Bearer ${token}`,
+			"Content-Type": "application/x-amz-json-1.0",
+			"x-amz-target": "AmazonCodeWhispererService.GetUsageLimits",
+		},
+		body: JSON.stringify({ origin: "AI_EDITOR", resourceType: "AGENTIC_REQUEST" }),
+		signal: AbortSignal.timeout(10000),
+	});
+	if (!res.ok) throw new Error(`HTTP ${res.status}`);
+	const data = await res.json();
+	const quotas: DirectQuota[] = [];
+	const resetEpoch = data.nextDateReset;
+	const resetAt = resetEpoch ? new Date(resetEpoch * 1000).toISOString() : null;
+
+	for (const b of data.usageBreakdownList || []) {
+		const used = b.currentUsageWithPrecision || 0;
+		const total = b.usageLimitWithPrecision || 0;
+		const name = (b.resourceType || "unknown").toLowerCase();
+		quotas.push({
+			name: `${name} (${used}/${total})`,
+			used: total > 0 ? Math.round((used / total) * 100) : 0,
+			total: 100,
+			resetAt,
+			unlimited: total === 0,
+			exhausted: total > 0 && used >= total,
+		});
+	}
+	return { plan: data.subscriptionInfo?.subscriptionTitle || null, quotas };
+}
+
+async function fetchKimiQuota(token: string): Promise<AccountQuota["quotas"]> {
+	const res = await fetch("https://api.kimi.com/coding/v1/usages", {
+		headers: {
+			Authorization: `Bearer ${token}`,
+			"Content-Type": "application/json",
+			"X-Msh-Platform": "omniroute",
+		},
+		signal: AbortSignal.timeout(10000),
+	});
+	if (!res.ok) throw new Error(`HTTP ${res.status}`);
+	const data = await res.json();
+	if (data.code) throw new Error(data.details?.[0]?.debug?.localizedMessage?.message || data.code);
+	const quotas: DirectQuota[] = [];
+	const usage = data.usage || {};
+	const limit = parseInt(usage.limit || "0", 10);
+	const used = parseInt(usage.used || "0", 10);
+	if (limit > 0) {
+		quotas.push({
+			name: "weekly",
+			used, total: limit,
+			resetAt: usage.resetTime || null,
+			unlimited: false,
+			exhausted: used >= limit,
+		});
+	}
+	return quotas;
+}
+
+async function fetchAllQuotasDirect(): Promise<AccountQuota[]> {
+	const conns = getConnectionTokens();
+	const results: AccountQuota[] = [];
+
+	const tasks = conns.map(async (conn) => {
+		const entry: AccountQuota = {
+			provider: conn.provider,
+			account: conn.name,
+			plan: null,
+			quotas: [],
+			error: null,
+		};
+
+		if (!conn.accessToken) {
+			entry.error = "No access token (API key provider — no quota API)";
+			return entry;
+		}
+
+		try {
+			switch (conn.provider) {
+				case "antigravity":
+					entry.quotas = await fetchAntigravityQuota(conn.accessToken);
+					break;
+				case "codex":
+					entry.quotas = await fetchCodexQuota(conn.accessToken, conn.psd.workspaceId || "");
+					entry.plan = conn.psd.workspacePlanType || null;
+					break;
+				case "kimi-coding":
+					entry.quotas = await fetchKimiQuota(conn.accessToken);
+					break;
+				case "kiro": {
+					const kiro = await fetchKiroQuota(conn.accessToken);
+					entry.quotas = kiro.quotas;
+					entry.plan = kiro.plan;
+					break;
+				}
+				default:
+					entry.error = "No quota API available";
+					break;
+			}
+		} catch (e: any) {
+			entry.error = e.message || "Failed";
+		}
+		return entry;
+	});
+
+	const settled = await Promise.allSettled(tasks);
+	for (const r of settled) {
+		if (r.status === "fulfilled") results.push(r.value);
+	}
+
+	return results.sort((a, b) => `${a.provider}/${a.account}`.localeCompare(`${b.provider}/${b.account}`));
 }
 
 // ────────────────────────── helpers ──────────────────────────
@@ -549,218 +822,10 @@ interface CallLog {
 	status: number;
 }
 
-interface UsageLimits {
-	providers: QuotaProviderEntry[];
-	meta: {
-		generatedAt: string;
-		filters: {
-			provider: string | null;
-			connectionId: string | null;
-		};
-		totalProviders: number;
-		isFallback?: boolean;
-	};
-}
-
-interface QuotaProviderEntry {
-	name: string;
-	provider: string;
-	quotaUsed: number;
-	quotaTotal: number;
-	percentRemaining: number;
-	resetAt: string | null;
-	tokenStatus: "valid" | "expired" | "expiring";
-	usageToday?: number;
-	usage30Day?: number;
-	accounts: AccountUsage[];
-}
-
-interface AccountUsage {
-	name: string;
-	usage: number;
-	limit?: number;
-	usageToday?: number;
-	usage30Day?: number;
-	lastActive?: string | null;
-}
-
 async function getLastCallLog(): Promise<CallLog | null> {
 	try {
 		const logs: CallLog[] = await api("/api/usage/call-logs?limit=1");
 		return logs?.[0] || null;
-	} catch {
-		return null;
-	}
-}
-
-function formatRelativeTime(timestamp: string | null): string {
-	if (!timestamp) return "never";
-	const now = Date.now();
-	const then = new Date(timestamp).getTime();
-	const diffMs = now - then;
-	
-	if (diffMs < 0) return "just now";
-	if (diffMs < 60000) return "just now";
-	if (diffMs < 3600000) return `${Math.floor(diffMs / 60000)}m ago`;
-	if (diffMs < 86400000) return `${Math.floor(diffMs / 3600000)}h ago`;
-	if (diffMs < 604800000) return `${Math.floor(diffMs / 86400000)}d ago`;
-	return new Date(timestamp).toLocaleDateString();
-}
-
-async function getUsageLimits(): Promise<UsageLimits | null> {
-	try {
-		const [data, connections, logs] = await Promise.all([
-			api("/api/usage/quota"),
-			listConnections(),
-			api("/api/usage/call-logs?limit=2000")
-		]);
-
-		const providersMap = new Map<string, QuotaProviderEntry>();
-		const now = new Date();
-		const todayUTC = now.toISOString().split("T")[0];
-		const thirtyDaysAgo = now.getTime() - (30 * 24 * 60 * 60 * 1000);
-
-		// Initialize all connections with zero values
-		for (const conn of connections) {
-			if (!providersMap.has(conn.provider)) {
-				providersMap.set(conn.provider, {
-					name: conn.provider.charAt(0).toUpperCase() + conn.provider.slice(1),
-					provider: conn.provider,
-					quotaUsed: 0,
-					quotaTotal: 0,
-					percentRemaining: 100,
-					resetAt: null,
-					tokenStatus: "valid",
-					usageToday: 0,
-					usage30Day: 0,
-					accounts: []
-				});
-			}
-			const p = providersMap.get(conn.provider)!;
-			if (!p.accounts.find(a => a.name === conn.name)) {
-				p.accounts.push({ 
-					name: conn.name, 
-					usage: 0,
-					usageToday: 0,
-					usage30Day: 0,
-					lastActive: null
-				});
-			}
-		}
-
-		// Check if we have actual quota data from the server
-		const hasQuotaData = data && data.providers && data.providers.length > 0;
-		let isFallback = false;
-
-		if (hasQuotaData) {
-			// Merge server quota data with our initialized map
-			for (const p of data.providers) {
-				if (providersMap.has(p.provider)) {
-					const existing = providersMap.get(p.provider)!;
-					// Keep our accounts list but update quota info
-					providersMap.set(p.provider, {
-						...p,
-						accounts: existing.accounts,
-						usageToday: existing.usageToday,
-						usage30Day: existing.usage30Day
-					});
-					// Merge account data from server
-					if (p.accounts) {
-						for (const serverAcc of p.accounts) {
-							const localAcc = existing.accounts.find(a => a.name === serverAcc.name);
-							if (localAcc) {
-								localAcc.usage = serverAcc.usage;
-								localAcc.limit = serverAcc.limit;
-							} else {
-								existing.accounts.push({
-									...serverAcc,
-									usageToday: 0,
-									usage30Day: 0,
-									lastActive: null
-								});
-							}
-						}
-					}
-				} else {
-					providersMap.set(p.provider, {
-						...p,
-						usageToday: 0,
-						usage30Day: 0,
-						accounts: p.accounts?.map(a => ({
-							...a,
-							usageToday: 0,
-							usage30Day: 0,
-							lastActive: null
-						})) || []
-					});
-				}
-			}
-		} else {
-			isFallback = true;
-		}
-
-		// Process call logs to calculate usage metrics
-		if (Array.isArray(logs) && logs.length > 0) {
-			for (const log of logs) {
-				const logTime = new Date(log.timestamp || Date.now());
-				const logDate = logTime.toISOString().split("T")[0];
-				const logTimestamp = logTime.getTime();
-				const isToday = logDate === todayUTC;
-				const isLast30Days = logTimestamp >= thirtyDaysAgo;
-
-				if (!providersMap.has(log.provider)) {
-					providersMap.set(log.provider, {
-						name: log.provider.charAt(0).toUpperCase() + log.provider.slice(1),
-						provider: log.provider,
-						quotaUsed: 0,
-						quotaTotal: 0,
-						percentRemaining: 100,
-						resetAt: null,
-						tokenStatus: "valid",
-						usageToday: 0,
-						usage30Day: 0,
-						accounts: []
-					});
-				}
-
-				const p = providersMap.get(log.provider)!;
-				if (isToday) p.usageToday = (p.usageToday || 0) + 1;
-				if (isLast30Days) p.usage30Day = (p.usage30Day || 0) + 1;
-
-				let acc = p.accounts.find(a => a.name === log.account);
-				if (!acc) {
-					acc = { 
-						name: log.account || "Default", 
-						usage: 0,
-						usageToday: 0,
-						usage30Day: 0,
-						lastActive: null
-					};
-					p.accounts.push(acc);
-				}
-				if (isToday) acc.usageToday = (acc.usageToday || 0) + 1;
-				if (isLast30Days) acc.usage30Day = (acc.usage30Day || 0) + 1;
-				
-				// Track last active timestamp
-				if (!acc.lastActive || logTimestamp > new Date(acc.lastActive).getTime()) {
-					acc.lastActive = log.timestamp || new Date().toISOString();
-				}
-			}
-		}
-
-		if (providersMap.size > 0) {
-			return {
-				providers: Array.from(providersMap.values()),
-				meta: {
-					generatedAt: now.toISOString(),
-					filters: { provider: null, connectionId: null },
-					totalProviders: providersMap.size,
-					isFallback
-				}
-			};
-		}
-
-		return null;
 	} catch {
 		return null;
 	}
@@ -947,9 +1012,9 @@ export default function (pi: ExtensionAPI) {
 			}
 		} else {
 			// OmniRoute isn't running — try to start it automatically
-			const spawned = startOmniRoute();
-			if (spawned) {
+			if (existsSync(OMNIROUTE_BIN)) {
 				ctx.ui.notify("OmniRoute not running — starting it now…", "info");
+				const spawned = startOmniRoute();
 				if (spawned) {
 					ctx.ui.setStatus("omni", "OmniRoute ⏳");
 					const came_up = await waitForHealthy();
@@ -988,15 +1053,9 @@ export default function (pi: ExtensionAPI) {
 	// ── /omni command ──
 
 	pi.registerCommand("omni", {
-		description: "OmniRoute: /omni [combos|providers|health|sync|setup-key|dashboard]",
+		description: "OmniRoute: /omni [combos|providers|health|limits|sync|setup-key|dashboard]",
 		getArgumentCompletions(prefix: string) {
-			const parts = prefix.split(/\s+/);
-			if (parts.length > 1 && (parts[0] === "limits" || parts[0] === "limit")) {
-				return ["force-refresh"]
-					.filter((s) => s.startsWith(parts[1]))
-					.map((s) => ({ value: `limits ${s}`, label: s }));
-			}
-			return ["combos", "providers", "health", "sync", "setup-key", "dashboard", "limits"]
+			return ["combos", "providers", "health", "limits", "sync", "setup-key", "dashboard"]
 				.filter((s) => s.startsWith(prefix))
 				.map((s) => ({ value: s, label: s }));
 		},
@@ -1052,7 +1111,6 @@ export default function (pi: ExtensionAPI) {
 					"  /omni sync            Sync models to Ctrl+P picker",
 					"  /omni setup-key       Create OmniRoute API key & save to models.json",
 					"  /omni dashboard       Dashboard URL",
-					"  /omni limits          Show provider usage limits & reset times",
 				);
 
 				ctx.ui.notify(lines.join("\n"), "info");
@@ -1792,436 +1850,6 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			// ──────────────── /omni limits ────────────────
-
-			if (sub === "limits" || sub === "limit") {
-				const isMock = parts.some(p => p.toLowerCase() === "--mock" || p.toLowerCase() === "mock");
-				const refresh = parts[1]?.toLowerCase() === "force-refresh" || parts[1]?.toLowerCase() === "refresh";
-				
-				if (isMock) {
-					ctx.ui.notify("Generating mock usage data…", "info");
-					
-					// Generate mock data for 3 Antigravity accounts
-					const mockConnections: Connection[] = [
-						{
-							id: "mock-conn-1",
-							provider: "antigravity",
-							authType: "oauth",
-							name: "work@example.com",
-							isActive: true,
-							testStatus: "active",
-							projectId: "my-project-12345",
-							tokenExpiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
-						},
-						{
-							id: "mock-conn-2",
-							provider: "antigravity",
-							authType: "oauth",
-							name: "personal@example.com",
-							isActive: true,
-							testStatus: "active",
-							projectId: "personal-project-67890",
-							tokenExpiresAt: new Date(Date.now() + 2 * 24 * 60 * 60 * 1000).toISOString(),
-						},
-						{
-							id: "mock-conn-3",
-							provider: "antigravity",
-							authType: "oauth",
-							name: "broken@example.com",
-							isActive: true,
-							testStatus: "expired",
-							lastError: "Token expired - please re-authenticate",
-							errorCode: "refresh_failed",
-							tokenExpiresAt: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(),
-						},
-					];
-					
-					const mockLimits: UsageLimits = {
-						providers: [
-							{
-								name: "Antigravity",
-								provider: "antigravity",
-								quotaUsed: 1200,
-								quotaTotal: 1500,
-								percentRemaining: 20,
-								resetAt: new Date(new Date().setHours(24, 0, 0, 0)).toISOString(),
-								tokenStatus: "valid",
-								usageToday: 10,
-								usage30Day: 50,
-								accounts: [
-									{
-										name: "work@example.com",
-										usage: 150,
-										limit: 1500,
-										usageToday: 5,
-										usage30Day: 25,
-										lastActive: new Date(Date.now() - 30 * 60 * 1000).toISOString(),
-									},
-									{
-										name: "personal@example.com",
-										usage: 1200,
-										limit: 1500,
-										usageToday: 5,
-										usage30Day: 20,
-										lastActive: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(),
-									},
-									{
-										name: "broken@example.com",
-										usage: 0,
-										limit: 1500,
-										usageToday: 0,
-										usage30Day: 5,
-										lastActive: new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString(),
-									},
-								],
-							},
-						],
-						meta: {
-							generatedAt: new Date().toISOString(),
-							filters: { provider: null, connectionId: null },
-							totalProviders: 1,
-							isFallback: false,
-						},
-					};
-					
-					// Use the same display logic as the real command
-					const connections = mockConnections;
-					const limits = mockLimits;
-					
-					const lines: string[] = [
-						"═══ OmniRoute Usage Limits (MOCK DATA) ═══",
-						"",
-						"📊 Mock Data Preview",
-						"   This is sample data to preview the feature.",
-						"",
-					];
-					
-					const providers = limits?.providers || [];
-					const connByProvider = new Map<string, Connection[]>();
-					for (const conn of connections) {
-						if (!connByProvider.has(conn.provider)) {
-							connByProvider.set(conn.provider, []);
-						}
-						connByProvider.get(conn.provider)!.push(conn);
-					}
-					
-					const allProviderNames = new Set([
-						...providers.map(p => p.provider),
-						...Array.from(connByProvider.keys())
-					]);
-					
-					const sortedProviderNames = Array.from(allProviderNames).sort((a, b) => {
-						if (a === "antigravity") return -1;
-						if (b === "antigravity") return 1;
-						return a.localeCompare(b);
-					});
-					
-					let totalActiveAccounts = 0;
-					
-					for (const providerName of sortedProviderNames) {
-						const provUsage = providers.find(p => p.provider === providerName);
-						const conns = connByProvider.get(providerName) || [];
-						const activeConns = conns.filter(c => c.isActive);
-						totalActiveAccounts += activeConns.length;
-						
-						let status = "✅";
-						if (provUsage && provUsage.quotaTotal > 0) {
-							if (provUsage.percentRemaining <= 10) status = "🔴";
-							else if (provUsage.percentRemaining <= 25) status = "⚠️";
-						} else if (activeConns.length === 0 && !provUsage) {
-							status = "⬜";
-						}
-						
-						lines.push(`─── ${status} ${providerName.toUpperCase()} ───`);
-						lines.push("");
-						
-						if (provUsage) {
-							if (provUsage.quotaTotal > 0) {
-								const percentage = 100 - provUsage.percentRemaining;
-								const remaining = provUsage.quotaTotal - provUsage.quotaUsed;
-								lines.push(`  Usage:     ${provUsage.quotaUsed.toLocaleString()} / ${provUsage.quotaTotal.toLocaleString()} (${percentage}%)`);
-								lines.push(`  Remaining: ${remaining.toLocaleString()}`);
-							} else if (limits?.meta?.isFallback) {
-								lines.push(`  Today:     ${provUsage.usageToday || 0} calls`);
-								lines.push(`  Last 30d:  ${provUsage.usage30Day || 0} calls`);
-							} else {
-								lines.push(`  Usage:     ${provUsage.quotaUsed.toLocaleString()} (Today)`);
-								lines.push(`  Limit:     unlimited or untracked`);
-							}
-							
-							if (provUsage.resetAt) {
-								lines.push(`  Resets:    ${new Date(provUsage.resetAt).toLocaleString()}`);
-							} else if (providerName === "antigravity" || providerName === "gemini") {
-								lines.push(`  Resets:    Daily at 00:00 PT`);
-							} else if (providerName === "openai" || providerName === "anthropic") {
-								lines.push(`  Resets:    Monthly (Billing Cycle)`);
-							} else if (!provUsage.resetAt) {
-								lines.push(`  Resets:    Periodically`);
-							}
-							
-							if (provUsage.tokenStatus !== "valid") {
-								lines.push(`  Status:    ⚠️ Token ${provUsage.tokenStatus}`);
-							}
-						} else {
-							lines.push(`  Usage:     0 (Today)`);
-							if (providerName === "antigravity") {
-								lines.push(`  Limit:     1,500 RPD (Google Free Tier)`);
-								lines.push(`  Resets:    Daily at 00:00 PT`);
-							}
-						}
-						
-						lines.push("");
-						if (conns.length > 0) {
-							lines.push(`  Accounts (${activeConns.length}/${conns.length} active):`);
-							for (const conn of conns) {
-								const activeFlag = conn.isActive ? "✅" : "⬜";
-								let accStatus = "";
-								
-								if (conn.provider === "antigravity") {
-									accStatus = conn.projectId ? ` [Project: ${conn.projectId}]` : " [⚠️ MISSING PROJECT ID]";
-								}
-								
-								if (conn.testStatus === "error" || conn.testStatus === "expired") {
-									accStatus += " [Needs Re-auth]";
-								}
-								
-								const accUsage = provUsage?.accounts?.find(a => a.name === conn.name);
-								
-								if (limits?.meta?.isFallback && accUsage) {
-									const todayLabel = accUsage.usageToday ? `${accUsage.usageToday} today` : "0 today";
-									const thirtyDayLabel = accUsage.usage30Day ? `, ${accUsage.usage30Day} last 30d` : "";
-									const lastActive = accUsage.lastActive ? ` · Last: ${formatRelativeTime(accUsage.lastActive)}` : "";
-									lines.push(`    ${activeFlag} ${conn.name}: ${todayLabel}${thirtyDayLabel}${lastActive}${accStatus}`);
-								} else if (accUsage && accUsage.limit && accUsage.limit > 0) {
-									const accPercentage = Math.round((accUsage.usage / accUsage.limit) * 100);
-									const usageLabel = accUsage.usage > 0 ? accUsage.usage.toLocaleString() : "0";
-									lines.push(`    ${activeFlag} ${conn.name}: ${usageLabel} / ${accUsage.limit.toLocaleString()} (${accPercentage}%)${accStatus}`);
-								} else if (accUsage && accUsage.usage > 0) {
-									lines.push(`    ${activeFlag} ${conn.name}: ${accUsage.usage.toLocaleString()}${accStatus}`);
-								} else {
-									lines.push(`    ${activeFlag} ${conn.name}: No usage tracked yet${accStatus}`);
-								}
-							}
-						} else if (provUsage?.accounts) {
-							lines.push("  Recorded Accounts:");
-							for (const acc of provUsage.accounts) {
-								if (limits?.meta?.isFallback) {
-									const todayLabel = acc.usageToday ? `${acc.usageToday} today` : "0 today";
-									const thirtyDayLabel = acc.usage30Day ? `, ${acc.usage30Day} last 30d` : "";
-									const lastActive = acc.lastActive ? ` · Last: ${formatRelativeTime(acc.lastActive)}` : "";
-									lines.push(`    • ${acc.name}: ${todayLabel}${thirtyDayLabel}${lastActive}`);
-								} else {
-									lines.push(`    • ${acc.name}: ${acc.usage.toLocaleString()}`);
-								}
-							}
-						}
-						
-						lines.push("");
-					}
-					
-					lines.push("─── Summary ───");
-					lines.push("");
-					lines.push(`  Active Accounts: ${totalActiveAccounts}`);
-					lines.push(`  Providers:       ${sortedProviderNames.length}`);
-					lines.push(`  Generated:       ${new Date(limits.meta.generatedAt).toLocaleTimeString()}`);
-					lines.push("");
-					lines.push("  💡 This is mock data. Remove --mock flag to see real usage.");
-					
-					ctx.ui.notify(lines.join("\n"), "info");
-					return;
-				}
-				
-				ctx.ui.notify(refresh ? "Refreshing provider status and fetching limits…" : "Fetching usage limits…", "info");
-
-				try {
-					if (refresh) {
-						const conns = await listConnections();
-						const active = conns.filter(c => c.isActive);
-						if (active.length > 0) {
-							// Trigger test for all active connections in parallel to refresh usage stats
-							await Promise.allSettled(active.map(c => api(`/api/providers/${c.id}/test`, { method: "POST" })));
-						}
-					}
-
-					// Get both connections and usage data
-					const [connections, limits] = await Promise.all([
-						listConnections(),
-						getUsageLimits()
-					]);
-
-					const lines: string[] = [
-						"═══ OmniRoute Usage Limits ═══",
-						"",
-					];
-
-					// Add data source header
-					if (limits?.meta?.isFallback) {
-						lines.push("📊 Estimated Usage (Calculated from Logs)");
-						lines.push("   Note: Only includes calls made through this OmniRoute instance.");
-						lines.push("");
-					}
-
-					const providers = limits?.providers || [];
-					const hasQuota = providers.length > 0;
-
-					if (!hasQuota && connections.length === 0) {
-						ctx.ui.notify(
-							"No provider accounts configured and no usage history found.\n\n" +
-							"Add providers in the dashboard: " + DASHBOARD_URL,
-							"info"
-						);
-						return;
-					}
-
-					// Group connections by provider for display
-					const connByProvider = new Map<string, Connection[]>();
-					for (const conn of connections) {
-						if (!connByProvider.has(conn.provider)) {
-							connByProvider.set(conn.provider, []);
-						}
-						connByProvider.get(conn.provider)!.push(conn);
-					}
-
-					// Use providers from limits as primary, then add missing ones from connections
-					const allProviderNames = new Set([
-						...providers.map(p => p.provider),
-						...Array.from(connByProvider.keys())
-					]);
-
-					const sortedProviderNames = Array.from(allProviderNames).sort((a, b) => {
-						// Always put antigravity first if it exists
-						if (a === "antigravity") return -1;
-						if (b === "antigravity") return 1;
-						return a.localeCompare(b);
-					});
-
-					let totalActiveAccounts = 0;
-
-					for (const providerName of sortedProviderNames) {
-						const provUsage = providers.find(p => p.provider === providerName);
-						const conns = connByProvider.get(providerName) || [];
-						const activeConns = conns.filter(c => c.isActive);
-						totalActiveAccounts += activeConns.length;
-
-						let status = "✅";
-						if (provUsage && provUsage.quotaTotal > 0) {
-							if (provUsage.percentRemaining <= 10) status = "🔴";
-							else if (provUsage.percentRemaining <= 25) status = "⚠️";
-						} else if (activeConns.length === 0 && !provUsage) {
-							status = "⬜";
-						}
-
-						lines.push(`─── ${status} ${providerName.toUpperCase()} ───`);
-						lines.push("");
-
-						if (provUsage) {
-							if (provUsage.quotaTotal > 0) {
-								const percentage = 100 - provUsage.percentRemaining;
-								const remaining = provUsage.quotaTotal - provUsage.quotaUsed;
-								lines.push(`  Usage:     ${provUsage.quotaUsed.toLocaleString()} / ${provUsage.quotaTotal.toLocaleString()} (${percentage}%)`);
-								lines.push(`  Remaining: ${remaining.toLocaleString()}`);
-							} else if (limits?.meta?.isFallback) {
-								// Show log-based usage metrics
-								lines.push(`  Today:     ${provUsage.usageToday || 0} calls`);
-								lines.push(`  Last 30d:  ${provUsage.usage30Day || 0} calls`);
-							} else {
-								lines.push(`  Usage:     ${provUsage.quotaUsed.toLocaleString()} (Today)`);
-								lines.push(`  Limit:     unlimited or untracked`);
-							}
-
-							if (provUsage.resetAt) {
-								lines.push(`  Resets:    ${new Date(provUsage.resetAt).toLocaleString()}`);
-							} else if (providerName === "antigravity" || providerName === "gemini") {
-								lines.push(`  Resets:    Daily at 00:00 PT`);
-							} else if (providerName === "openai" || providerName === "anthropic") {
-								lines.push(`  Resets:    Monthly (Billing Cycle)`);
-							} else if (!provUsage.resetAt) {
-								lines.push(`  Resets:    Periodically`);
-							}
-							
-							if (provUsage.tokenStatus !== "valid") {
-								lines.push(`  Status:    ⚠️ Token ${provUsage.tokenStatus}`);
-							}
-						} else {
-							lines.push(`  Usage:     0 (Today)`);
-							if (providerName === "antigravity") {
-								lines.push(`  Limit:     1,500 RPD (Google Free Tier)`);
-								lines.push(`  Resets:    Daily at 00:00 PT`);
-							}
-						}
-
-						// Show accounts
-						lines.push("");
-						if (conns.length > 0) {
-							lines.push(`  Accounts (${activeConns.length}/${conns.length} active):`);
-							for (const conn of conns) {
-								const activeFlag = conn.isActive ? "✅" : "⬜";
-								let accStatus = "";
-								
-								if (conn.provider === "antigravity") {
-									accStatus = conn.projectId ? ` [Project: ${conn.projectId}]` : " [⚠️ MISSING PROJECT ID]";
-								}
-
-								if (conn.testStatus === "error" || conn.testStatus === "expired") {
-									accStatus += " [Needs Re-auth]";
-								}
-
-								const accUsage = provUsage?.accounts?.find(a => a.name === conn.name);
-								
-								if (limits?.meta?.isFallback && accUsage) {
-									// Show log-based metrics with last active
-									const todayLabel = accUsage.usageToday ? `${accUsage.usageToday} today` : "0 today";
-									const thirtyDayLabel = accUsage.usage30Day ? `, ${accUsage.usage30Day} last 30d` : "";
-									const lastActive = accUsage.lastActive ? ` · Last: ${formatRelativeTime(accUsage.lastActive)}` : "";
-									lines.push(`    ${activeFlag} ${conn.name}: ${todayLabel}${thirtyDayLabel}${lastActive}${accStatus}`);
-								} else if (accUsage && accUsage.limit && accUsage.limit > 0) {
-									const accPercentage = Math.round((accUsage.usage / accUsage.limit) * 100);
-									const usageLabel = accUsage.usage > 0 ? accUsage.usage.toLocaleString() : "0";
-									lines.push(`    ${activeFlag} ${conn.name}: ${usageLabel} / ${accUsage.limit.toLocaleString()} (${accPercentage}%)${accStatus}`);
-								} else if (accUsage && accUsage.usage > 0) {
-									lines.push(`    ${activeFlag} ${conn.name}: ${accUsage.usage.toLocaleString()}${accStatus}`);
-								} else {
-									lines.push(`    ${activeFlag} ${conn.name}: No usage tracked yet${accStatus}`);
-								}
-							}
-						} else if (provUsage?.accounts) {
-							lines.push("  Recorded Accounts:");
-							for (const acc of provUsage.accounts) {
-								if (limits?.meta?.isFallback) {
-									const todayLabel = acc.usageToday ? `${acc.usageToday} today` : "0 today";
-									const thirtyDayLabel = acc.usage30Day ? `, ${acc.usage30Day} last 30d` : "";
-									const lastActive = acc.lastActive ? ` · Last: ${formatRelativeTime(acc.lastActive)}` : "";
-									lines.push(`    • ${acc.name}: ${todayLabel}${thirtyDayLabel}${lastActive}`);
-								} else {
-									lines.push(`    • ${acc.name}: ${acc.usage.toLocaleString()}`);
-								}
-							}
-						}
-
-						lines.push("");
-					}
-
-					lines.push("─── Summary ───");
-					lines.push("");
-					lines.push(`  Active Accounts: ${totalActiveAccounts}`);
-					lines.push(`  Providers:       ${sortedProviderNames.length}`);
-
-					if (limits?.meta?.generatedAt) {
-						lines.push(`  Generated:       ${new Date(limits.meta.generatedAt).toLocaleTimeString()}`);
-					}
-					
-					if (!refresh) {
-						lines.push("");
-						lines.push("  Tip: Use '/omni limits force-refresh' to update stats.");
-					}
-
-					ctx.ui.notify(lines.join("\n"), "info");
-				} catch (e: any) {
-					ctx.ui.notify(`Failed to fetch usage limits: ${e.message}`, "error");
-				}
-				return;
-			}
-
 			// ──────────────── /omni dashboard ────────────────
 
 			if (sub === "dashboard" || sub === "dash") {
@@ -2241,10 +1869,77 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
+			// ──────────────── /omni limits ────────────────
+
+			if (sub === "limits" || sub === "quota" || sub === "usage") {
+				try {
+					ctx.ui.setStatus("omni", "Fetching live quotas…");
+					const accounts = await fetchAllQuotasDirect();
+					const lines: string[] = ["═══ OmniRoute Usage Limits (live) ═══", ""];
+
+					for (const acct of accounts) {
+						const label = `${acct.provider}/${acct.account}${acct.plan ? ` (${acct.plan})` : ""}`;
+						lines.push(`─── ${label} ───`);
+
+						if (acct.error) {
+							lines.push(`  ${acct.error}`);
+						} else if (!acct.quotas.length) {
+							lines.push("  No quota data returned");
+						} else {
+							const sorted = acct.quotas.sort((a, b) => a.name.localeCompare(b.name));
+							const active = sorted.filter((q) => q.used > 0 || q.exhausted);
+							const unused = sorted.filter((q) => q.used === 0 && !q.exhausted && !q.unlimited);
+
+							// Show models with usage first
+							for (const q of active) {
+								const remaining = q.total - q.used;
+								const pct = q.total > 0 ? Math.round((remaining / q.total) * 100) : 100;
+								const resetDate = q.resetAt ? q.resetAt.slice(0, 16).replace("T", " ") : "?";
+
+								const filled = q.total > 0 ? Math.round((q.used / q.total) * 20) : 0;
+								const bar = "█".repeat(filled) + "░".repeat(20 - filled);
+
+								if (q.exhausted || remaining <= 0) {
+									lines.push(`  ❌ ${q.name}: EXHAUSTED — resets ${resetDate}`);
+								} else if (pct <= 20) {
+									lines.push(`  ⚠️  ${q.name}: [${bar}] ${pct}% left — resets ${resetDate}`);
+								} else {
+									lines.push(`  ${q.name}: [${bar}] ${pct}% left — resets ${resetDate}`);
+								}
+							}
+
+							// Show unlimited models
+							const unlimitedModels = sorted.filter((q) => q.unlimited);
+							if (unlimitedModels.length) {
+								lines.push(`  ${unlimitedModels.map((q) => q.name).join(", ")}: unlimited`);
+							}
+
+							// Summarize untouched models
+							if (unused.length > 0 && active.length > 0) {
+								lines.push(`  + ${unused.length} more model(s) at 100%`);
+							} else if (unused.length > 0 && active.length === 0) {
+								// All unused — show a few names
+								const preview = unused.slice(0, 4).map((q) => q.name).join(", ");
+								const more = unused.length > 4 ? ` +${unused.length - 4} more` : "";
+								lines.push(`  All at 100%: ${preview}${more}`);
+							}
+						}
+						lines.push("");
+					}
+
+					ctx.ui.notify(lines.join("\n"), "info");
+					ctx.ui.setStatus("omni", "OmniRoute ✓");
+				} catch (e: any) {
+					ctx.ui.notify(`Failed to fetch limits: ${e.message}`, "error");
+					ctx.ui.setStatus("omni", "OmniRoute ✓");
+				}
+				return;
+			}
+
 			// ──────────────── Unknown ────────────────
 
 			ctx.ui.notify(
-				`Unknown: /omni ${sub}\n\nAvailable: combos, providers, health, sync, setup-key, dashboard, limits`,
+				`Unknown: /omni ${sub}\n\nAvailable: combos, providers, health, limits, sync, setup-key, dashboard`,
 				"warning"
 			);
 		},
